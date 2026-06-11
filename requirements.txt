@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+pyyaml
+supabase
+openpyxl
+numpy
+python-dateutil

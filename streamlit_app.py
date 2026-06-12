@@ -939,12 +939,15 @@ def _fetch_all(table: str, snap: str, page_size: int = 1000) -> list:
 def _rent_roll():
     try:
         snap = _latest_snapshot("rent_roll")
+       
         if not snap:
             return None
         data = _fetch_all("rent_roll", snap)
         if not data:
             return None
         df = pd.DataFrame(data)
+     
+          
         df = df.rename(columns={
             "unit_id":     "Unit ID",
             "market_rent": "Market Rent",
@@ -1729,6 +1732,12 @@ with st.spinner("Loading portfolio data…"):
     df_leads_df     = _leads()
     df_calls, calls_meta = _calls_data()
     leasing_summary = _leasing_summary()
+
+    df_rr_f = df_rr.copy() if df_rr is not None else None
+    df_vac_f = df_vac.copy() if df_vac is not None else None
+
+
+    
     # Build portfolio map — local CSV is authoritative; Supabase is fallback only
     prop_portfolio_map = _owner_portfolios()
     if not prop_portfolio_map:

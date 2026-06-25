@@ -32,6 +32,18 @@ def clean_money(value):
         return None
     return float(number)
 
+def clean_number(value):
+    if pd.isna(value):
+        return None
+
+    value = str(value).replace("$", "").replace(",", "").replace('"', "").strip()
+
+    if value == "" or value.lower() == "nan":
+        return None
+
+    number = pd.to_numeric(value, errors="coerce")
+    return None if pd.isna(number) else float(number)
+
 
 records = []
 
@@ -45,6 +57,11 @@ for _, row in df.iterrows():
         "d31_60": clean_money(row.get("31-60")),
         "d61_90": clean_money(row.get("61-90")),
         "d91_plus": clean_money(row.get("91+")),
+        "gl_account_name": clean_text(row.get("GL Account Name")),
+        "gl_account_number": clean_text(row.get("GL Account Number")),
+        "total_amount": clean_number(row.get("Total Amount")),
+        "charge_date": clean_text(row.get("Charge Date")),
+        "posting_date": clean_text(row.get("Posting Date")),
     })
 
 supabase.table("aged_receivable").delete().eq("snapshot_date", snapshot_date).execute()

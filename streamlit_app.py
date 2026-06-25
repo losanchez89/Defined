@@ -1,7 +1,6 @@
 import streamlit as st
 
 st.title("Defined")
-
 """
 Property Management Executive Dashboard — Streamlit
 Defined Property Management · v2.0
@@ -339,100 +338,155 @@ def load_showings(directory):
 def calculate_metrics(df_rent_roll, df_funnel=None):
     """
     Calcula todas las métricas del Box Score agrupando por Property.
-
-    Args:
-        df_rent_roll: DataFrame del rent roll
-        df_funnel: DataFrame del funnel (opcional)
-
-    Returns:
-        DataFrame con todas las métricas calculadas
     """
     print("🔢 Calculando métricas por Property...")
 
-    # Agrupar por Property
-    grouped = df_rent_roll.groupby('Property')
+    base_cols = [
+        "Property", "Total Units", "Current", "Current %",
+        "Economic Occ %", "Physical Occ %",
+        "Vacant-Unrented", "Vacant-Unrented %",
+        "Vacant-Rented", "Vacant-Rented %",
+        "Notice-Unrented", "Notice-Unrented %",
+        "Notice-Rented", "Notice-Rented %",
+        "Evict", "Revenue Gap ($)",
+        "Inquiries", "Completed Showings", "Rental Apps",
+        "Decision Pending", "Approved", "Signed Leases",
+        "Lease Conversion %",
+    ]
 
-    # Inicializar diccionario de resultados
+    if df_rent_roll is None or len(df_rent_roll) == 0:
+        print("⚠️ Rent Roll vacío")
+        return pd.DataFrame(columns=base_cols)
+
+    df_rent_roll = df_rent_roll.copy()
+
+    # Normalizar nombres por si vienen de Supabase en lowercase o CSV en Title Case
+    df_rent_roll = df_rent_roll.rename(columns={
+        "property": "Property",
+        "unit": "Unit",
+        "unit_id": "Unit ID",
+        "status": "Status",
+        "tenant": "Tenant",
+        "rent": "Rent",
+        "market_rent": "Market Rent",
+        "deposit": "Deposit",
+        "past_due": "Past Due",
+        "lease_from": "Lease From",
+        "lease_to": "Lease To",
+        "bd_ba": "BD/BA",
+        "portfolio": "Portfolio",
+    })
+
+    if "Property" not in df_rent_roll.columns:
+        print("⚠️ Rent Roll sin columna Property")
+        print("RENT ROLL COLS:", df_rent_roll.columns.tolist())
+        return pd.DataFrame(columns=base_cols)
+
+    if "Status" not in df_rent_roll.columns:
+        print("⚠️ Rent Roll sin columna Status")
+        df_rent_roll["Status"] = ""
+    else:
+        df_rent_roll["Status"] = df_rent_roll["Status"].astype(str).str.strip()
+
+    for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
+        if col in df_rent_roll.columns:
+            df_rent_roll[col] = pd.to_numeric(df_rent_roll[col], errors="coerce").fillna(0)
+
+    if "Market Rent" not in df_rent_roll.columns:
+        df_rent_roll["Market Rent"] = 0
+
+    grouped = df_rent_roll.groupby("Property", dropna=False)
     results = []
 
     for property_name, group in grouped:
         total_units = len(group)
+        status_counts = group["Status"].value_counts(dropna=False)
 
-        # Conteos por Status
-        status_counts = group['Status'].value_counts()
+        current = int(status_counts.get("Current", 0))
+        vacant_unrented = int(status_counts.get("Vacant-Unrented", 0))
+        vacant_rented = int(status_counts.get("Vacant-Rented", 0))
+        notice_unrented = int(status_counts.get("Notice-Unrented", 0))
+        notice_rented = int(status_counts.get("Notice-Rented", 0))
+        evict = int(status_counts.get("Evict", 0))
 
-        current = status_counts.get('Current', 0)
-        vacant_unrented = status_counts.get('Vacant-Unrented', 0)
-        vacant_rented = status_counts.get('Vacant-Rented', 0)
-        notice_unrented = status_counts.get('Notice-Unrented', 0)
-        notice_rented = status_counts.get('Notice-Rented', 0)
-        evict = status_counts.get('Evict', 0)
-
-        # Porcentajes
         current_pct = (current / total_units * 100) if total_units > 0 else 0
         vacant_unrented_pct = (vacant_unrented / total_units * 100) if total_units > 0 else 0
         vacant_rented_pct = (vacant_rented / total_units * 100) if total_units > 0 else 0
         notice_unrented_pct = (notice_unrented / total_units * 100) if total_units > 0 else 0
         notice_rented_pct = (notice_rented / total_units * 100) if total_units > 0 else 0
 
-        # Economic Occ %: (Current + Vacant-Rented + Notice-Unrented) / Total Units
-        economic_occ = (current + vacant_rented + notice_unrented) / total_units * 100 if total_units > 0 else 0
+        economic_occ = (
+            (current + vacant_rented + notice_unrented) / total_units * 100
+            if total_units > 0 else 0
+        )
+        physical_occ = (
+            (current + notice_unrented + evict) / total_units * 100
+            if total_units > 0 else 0
+        )
 
-        # Physical Occ %: (Current + Notice-Unrented + Evict) / Total Units
-        physical_occ = (current + notice_unrented + evict) / total_units * 100 if total_units > 0 else 0
+        revenue_gap_mask = group["Status"].isin(["Vacant-Unrented", "Evict"])
+        revenue_gap = float(group.loc[revenue_gap_mask, "Market Rent"].sum())
 
-        # Revenue Gap (Revenue at Risk): Vacant-Unrented + Evict units × Market Rent each
-        revenue_gap_mask = group['Status'].isin(['Vacant-Unrented', 'Evict'])
-        revenue_gap = float(group.loc[revenue_gap_mask, 'Market Rent'].sum())
+        results.append({
+            "Property": property_name,
+            "Total Units": total_units,
+            "Current": current,
+            "Current %": current_pct,
+            "Economic Occ %": economic_occ,
+            "Physical Occ %": physical_occ,
+            "Vacant-Unrented": vacant_unrented,
+            "Vacant-Unrented %": vacant_unrented_pct,
+            "Vacant-Rented": vacant_rented,
+            "Vacant-Rented %": vacant_rented_pct,
+            "Notice-Unrented": notice_unrented,
+            "Notice-Unrented %": notice_unrented_pct,
+            "Notice-Rented": notice_rented,
+            "Notice-Rented %": notice_rented_pct,
+            "Evict": evict,
+            "Revenue Gap ($)": revenue_gap,
+        })
 
-        # Crear registro
-        record = {
-            'Property': property_name,
-            'Total Units': total_units,
-            'Current': current,
-            'Current %': current_pct,
-            'Economic Occ %': economic_occ,
-            'Physical Occ %': physical_occ,
-            'Vacant-Unrented': vacant_unrented,
-            'Vacant-Unrented %': vacant_unrented_pct,
-            'Vacant-Rented': vacant_rented,
-            'Vacant-Rented %': vacant_rented_pct,
-            'Notice-Unrented': notice_unrented,
-            'Notice-Unrented %': notice_unrented_pct,
-            'Notice-Rented': notice_rented,
-            'Notice-Rented %': notice_rented_pct,
-            'Evict': evict,
-            'Revenue Gap ($)': revenue_gap
-        }
-
-        results.append(record)
-
-    # Crear DataFrame
     df_metrics = pd.DataFrame(results)
+    if df_metrics.empty:
+        print("⚠️ df_metrics vacío")
+        return pd.DataFrame(columns=base_cols)
 
-    # Integrar Funnel (Left Join)
-    if df_funnel is not None:
-        print("   Integrando datos del Funnel...")
-        df_metrics = df_metrics.merge(df_funnel, on='Property', how='left')
+    funnel_cols = [
+        "Inquiries", "Completed Showings", "Rental Apps",
+        "Decision Pending", "Approved", "Signed Leases",
+    ]
 
-        # Calcular Lease Conversion %
-        df_metrics['Lease Conversion %'] = (
-            df_metrics['Signed Leases'] / df_metrics['Inquiries'] * 100
-        ).fillna(0)
-        df_metrics['Lease Conversion %'] = df_metrics['Lease Conversion %'].replace([float('inf'), -float('inf')], 0)
+    if df_funnel is not None and len(df_funnel) > 0:
+        df_funnel = df_funnel.copy().rename(columns={
+            "property": "Property",
+            "inquiries": "Inquiries",
+            "completed_showings": "Completed Showings",
+            "rental_apps": "Rental Apps",
+            "decision_pending": "Decision Pending",
+            "approved": "Approved",
+            "signed_leases": "Signed Leases",
+        })
+        if "Property" in df_funnel.columns:
+            print("   Integrando datos del Funnel...")
+            df_metrics = df_metrics.merge(df_funnel, on="Property", how="left")
+        else:
+            print("   ⚠️ Funnel skipped: missing Property column")
     else:
-        # Si no hay funnel, agregar columnas vacías
-        funnel_cols = ['Inquiries', 'Completed Showings', 'Rental Apps',
-                      'Decision Pending', 'Approved', 'Signed Leases', 'Lease Conversion %']
-        for col in funnel_cols:
+        print("   ⚠️ Funnel skipped: empty funnel")
+
+    for col in funnel_cols:
+        if col not in df_metrics.columns:
             df_metrics[col] = 0
+        else:
+            df_metrics[col] = pd.to_numeric(df_metrics[col], errors="coerce").fillna(0)
 
-    # Ordenar por Property
-    df_metrics = df_metrics.sort_values('Property').reset_index(drop=True)
+    df_metrics["Lease Conversion %"] = (
+        df_metrics["Signed Leases"] / df_metrics["Inquiries"].replace(0, pd.NA) * 100
+    ).fillna(0).replace([float("inf"), float("-inf")], 0)
 
+    df_metrics = df_metrics.sort_values("Property").reset_index(drop=True)
     print(f"   ✓ Métricas calculadas para {len(df_metrics)} propiedades")
     return df_metrics
-
 
 def calculate_totals_row(df_metrics):
     """
@@ -957,10 +1011,17 @@ def _rent_roll():
             "past_due":    "Past Due",
             "portfolio":   "Portfolio",
         })
-        for col in ["property", "unit", "status", "tenant", "rent", "deposit"]:
-            if col in df.columns:
-                df = df.rename(columns={col: col.capitalize()})
+        df = df.rename(columns={
+            "property": "Property",
+            "unit": "Unit",
+            "status": "Status",
+            "tenant": "Tenant",
+            "rent": "Rent",
+            "deposit": "Deposit",
+        })
+        
         if "Status" in df.columns:
+            df["Status"] = df["Status"].astype(str).str.strip()
             df = df[df["Status"].isin(VALID_STATUSES)].copy()
         for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
             if col in df.columns:
@@ -991,9 +1052,14 @@ def _rent_roll_all():
             "past_due":    "Past Due",
             "portfolio":   "Portfolio",
         })
-        for col in ["property", "unit", "status", "tenant", "rent", "deposit"]:
-            if col in df.columns:
-                df = df.rename(columns={col: col.capitalize()})
+        df = df.rename(columns={
+            "property": "Property",
+            "unit": "Unit",
+            "status": "Status",
+            "tenant": "Tenant",
+            "rent": "Rent",
+            "deposit": "Deposit",
+        })
         for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -1233,8 +1299,13 @@ def _aged_receivable():
             "d31_60":            "31-60",
             "d61_90":            "61-90",
             "d91_plus":          "91+",
+            "gl_account_name":   "GL Account Name",
+            "gl_account_number": "GL Account Number",
+            "total_amount":      "Total Amount",
+            "charge_date":       "Charge Date",
+            "posting_date":      "Posting Date",
         })
-        for col in ["Amount Receivable", "0-30", "31-60", "61-90", "91+"]:
+        for col in ["Amount Receivable", "Total Amount", "0-30", "31-60", "61-90", "91+"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         if "Amount Receivable" in df.columns:
@@ -1275,7 +1346,7 @@ def _work_orders():
             "status":                                "Status",
             "priority":                              "Priority",
             "amount":                                "Amount",
-            "created_at":                            "Created At",
+            "created_at_raw":                        "Created At",
             "completed_on":                          "Completed On",
             "days_to_resolve":                       "Days to Resolve",
             "work_order_issue":                      "Work Order Issue",
@@ -1297,12 +1368,12 @@ def _work_orders():
             "Created At", "Completed On", "Estimate Req On", "Estimated On",
             "Estimate Approved On", "Estimate Approval Last Requested On", "Work Done On",
         ]
+
+
         for col in date_cols:
             if col in df.columns:
-                dt = pd.to_datetime(df[col], errors="coerce")
-                if dt.dt.tz is not None:
-                    dt = dt.dt.tz_convert(None)
-                df[col] = dt
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
         return df
     except Exception as e:
         log.error("work_orders desde Supabase: %s", e)
@@ -1487,6 +1558,55 @@ def _historical():
         log.error("historical_metrics desde Supabase: %s", e)
         return None
 
+@st.cache_data(ttl=300)
+def load_historical_metrics():
+    res = (
+        supabase.table("historical_metrics")
+        .select("*")
+        .order("date")
+        .execute()
+    )
+
+    df = pd.DataFrame(res.data)
+
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    numeric_cols = [
+        "physical_occupancy",
+        "economic_occupancy",
+        "total_units",
+        "occupied_units",
+        "vacant_units",
+        "sum_of_rent",
+        "inquiries",
+        "showings",
+        "leased",
+        "collection_rate",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+def save_portfolio_history_snapshot(row: dict):
+    """
+    Guarda o actualiza el snapshot histórico del portfolio.
+    Si ya existe snapshot_date, lo actualiza.
+    """
+    try:
+        supabase.table("portfolio_history").upsert(
+            row,
+            on_conflict="snapshot_date"
+        ).execute()
+    except Exception as e:
+        st.warning(f"Could not save portfolio history snapshot: {e}")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _owner_portfolios():
     """
@@ -1665,52 +1785,74 @@ def _calls_data():
         log.error("Users_Dashboard XLSX: %s", e)
         return None, None
 
+@st.cache_data(ttl=300)
+def _portfolio_history():
+    try:
+        data = (
+            supabase.table("portfolio_history")
+            .select("*")
+            .order("snapshot_date")
+            .execute()
+            .data
+        )
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+        return df
+
+    except Exception as e:
+        log.warning("portfolio_history load failed: %s", e)
+        return pd.DataFrame()
+
 # ============================================================================
 # SNAPSHOT
 # ============================================================================
 
-def _save_snapshot(df_rr, totals, phys_occ, econ_occ) -> bool:
-    p = DATA_DIR / "historical_metrics.csv"
-    today = datetime.now().strftime("%Y-%m-%d")
-    row = {
-        "Date":               today,
-        "Physical Occupancy": round(phys_occ, 2),
-        "Economic Occupancy": round(econ_occ, 2),
-        "Total Units":        int(totals.get("Total Units", 0)),
-        "Occupied Units":     int(totals.get("Current", 0)),
-        "Vacant Units":       int(totals.get("Vacant-Unrented", 0)),
-        "Sum of Rent":        round(float(df_rr["Rent"].sum()), 2) if df_rr is not None and "Rent" in df_rr.columns else 0,
-        "Inquiries":          int(totals.get("Inquiries", 0)),
-        "Showings":           int(totals.get("Completed Showings", 0)),
-        "Signed Leases":      int(totals.get("Signed Leases", 0)),
-        "Collection Rate":    round(
-            max(0.0, min(100.0, (
-                (float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) -
-                 float(clean_money_column(df_rr.loc[df_rr["Status"]=="Current","Past Due"]).clip(lower=0).sum())) /
-                float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) * 100
-            ))) if (
-                df_rr is not None and "Rent" in df_rr.columns and "Past Due" in df_rr.columns and "Status" in df_rr.columns
-                and float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) > 0
-            ) else 0.0, 2),
-    }
-    if p.exists():
-        try:
-            h = pd.read_csv(p, dtype=str)
-            if today in h["Date"].values: return False
-            h = pd.concat([h, pd.DataFrame([row])], ignore_index=True)
-        except Exception as e:
-            log.warning("historical_metrics.csv unreadable, starting fresh: %s", e)
-            h = pd.DataFrame([row])
-    else: h = pd.DataFrame([row])
-    # Keep only the last 180 days (6 months)
-    try:
-        h["_dt"] = pd.to_datetime(h["Date"], errors="coerce")
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=180)
-        h = h[h["_dt"] >= cutoff].drop(columns=["_dt"])
-    except Exception as e:
-        log.warning("historical_metrics.csv date trim failed: %s", e)
-    h.to_csv(p, index=False)
-    return True
+#def _save_snapshot(df_rr, totals, phys_occ, econ_occ) -> bool:
+#    p = DATA_DIR / "historical_metrics.csv"
+#    today = datetime.now().strftime("%Y-%m-%d")
+#    row = {
+#        "Date":               today,
+#        "Physical Occupancy": round(phys_occ, 2),
+#        "Economic Occupancy": round(econ_occ, 2),
+#        "Total Units":        int(totals.get("Total Units", 0)),
+#        "Occupied Units":     int(totals.get("Current", 0)),
+#        "Vacant Units":       int(totals.get("Vacant-Unrented", 0)),
+#        "Sum of Rent":        round(float(df_rr["Rent"].sum()), 2) if df_rr is not None and "Rent" in df_rr.columns else 0,
+#        "Inquiries":          int(totals.get("Inquiries", 0)),
+#        "Showings":           int(totals.get("Completed Showings", 0)),
+#        "Signed Leases":      int(totals.get("Signed Leases", 0)),
+#        "Collection Rate":    round(
+#            max(0.0, min(100.0, (
+#                (float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) -
+#                 float(clean_money_column(df_rr.loc[df_rr["Status"]=="Current","Past Due"]).clip(lower=0).sum())) /
+#                float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) * 100
+#            ))) if (
+#                df_rr is not None and "Rent" in df_rr.columns and "Past Due" in df_rr.columns and "Status" in df_rr.columns
+#                and float(df_rr.loc[df_rr["Status"]=="Current","Rent"].sum()) > 0
+#            ) else 0.0, 2),
+#    }
+#    if p.exists():
+#        try:
+#            h = pd.read_csv(p, dtype=str)
+#            if today in h["Date"].values: return False
+#            h = pd.concat([h, pd.DataFrame([row])], ignore_index=True)
+#        except Exception as e:
+#            log.warning("historical_metrics.csv unreadable, starting fresh: %s", e)
+#            h = pd.DataFrame([row])
+#    else: h = pd.DataFrame([row])
+#    # Keep only the last 180 days (6 months)
+#    try:
+#        h["_dt"] = pd.to_datetime(h["Date"], errors="coerce")
+#        cutoff = pd.Timestamp.now() - pd.Timedelta(days=180)
+#        h = h[h["_dt"] >= cutoff].drop(columns=["_dt"])
+#    except Exception as e:
+#        log.warning("historical_metrics.csv date trim failed: %s", e)
+#    h.to_csv(p, index=False)
+#    return True#
 
 # ============================================================================
 # LOAD ALL DATA (before sidebar so filter can use it)
@@ -1732,12 +1874,75 @@ with st.spinner("Loading portfolio data…"):
     df_leads_df     = _leads()
     df_calls, calls_meta = _calls_data()
     leasing_summary = _leasing_summary()
+    df_ph = load_historical_metrics()
+
+    if not df_ph.empty:
+        df_ph = df_ph.copy()
+        df_ph["date"] = pd.to_datetime(df_ph["date"])
 
     df_rr_f = df_rr.copy() if df_rr is not None else None
     df_vac_f = df_vac.copy() if df_vac is not None else None
 
 
-    
+        # Save portfolio history snapshot
+    if df_rr is not None and totals is not None:
+        total_units_hist = int(totals.get("Total Units", 0) or 0)
+
+        monthly_rent_hist = (
+            float(df_rr["Rent"].sum())
+            if "Rent" in df_rr.columns
+            else 0.0
+        )
+
+        outstanding_hist = (
+            float(df_rr["Past Due"].sum())
+            if "Past Due" in df_rr.columns
+            else 0.0
+        )
+
+        collection_rate_hist = (
+            ((monthly_rent_hist - outstanding_hist) / monthly_rent_hist * 100)
+            if monthly_rent_hist > 0
+            else 0.0
+        )
+
+        vacant_unrented_hist = int(totals.get("Vacant-Unrented", 0) or 0)
+        notice_unrented_hist = int(totals.get("Notice-Unrented", 0) or 0)
+
+        total_past_due_hist = 0
+        exposure_91_hist = 0
+        delinquency_rate_hist = 0
+
+        if df_aged is not None and "Amount Receivable" in df_aged.columns:
+            total_past_due_hist = float(df_aged["Amount Receivable"].sum())
+
+        if "91+" in df_aged.columns:
+            exposure_91_hist = float(df_aged["91+"].sum())
+
+        delinquency_rate_hist = (
+            total_past_due_hist / monthly_rent_hist * 100
+            if monthly_rent_hist > 0
+            else 0
+        )
+
+        history_row = {
+            "snapshot_date": datetime.now().date().isoformat(),
+            "total_units": total_units_hist,
+            "physical_occupancy": float(phys_occ or 0),
+            "economic_occupancy": float(econ_occ or 0),
+            "monthly_rent": monthly_rent_hist,
+            "collection_rate": collection_rate_hist,
+            "outstanding_balance": outstanding_hist,
+            "vacant_unrented": vacant_unrented_hist,
+            "notice_unrented": notice_unrented_hist,
+            "total_past_due": total_past_due_hist,
+            "delinquency_rate": delinquency_rate_hist,
+            "exposure_91": exposure_91_hist,
+        }
+
+        save_portfolio_history_snapshot(history_row)
+
+       
     # Build portfolio map — local CSV is authoritative; Supabase is fallback only
     prop_portfolio_map = _owner_portfolios()
     if not prop_portfolio_map:
@@ -1768,13 +1973,20 @@ with st.spinner("Loading portfolio data…"):
                 if not _pf_df.empty else {}
             )
 
-if "snapshot_saved" not in st.session_state:
-    st.session_state.snapshot_saved = False
-if not st.session_state.snapshot_saved and df_metrics is not None and totals is not None:
-    if _save_snapshot(df_rr, totals, phys_occ, econ_occ):
-        _historical.clear()
-        df_hist = _historical()
-    st.session_state.snapshot_saved = True
+
+df_hist = load_historical_metrics()
+
+if df_hist is not None and not df_hist.empty:
+    df_hist = df_hist.rename(columns={
+        "date": "Date",
+        "physical_occupancy": "Physical Occupancy",
+        "economic_occupancy": "Economic Occupancy",
+        "total_units": "Total Units",
+        "occupied_units": "Occupied Units",
+        "vacant_units": "Vacant Units",
+        "sum_of_rent": "Sum of Rent",
+        "collection_rate": "Collection Rate",
+    })
 
 # ============================================================================
 # PROPERTY FILTER HELPER
@@ -2230,33 +2442,41 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 
     def _gauge_fig(value, title, lo, hi, target, suffix="%"):
         mid = lo + (target - lo) * 0.6
+
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
             value=value,
             number={"suffix": suffix, "font": {"size": 36, "color": "#1E293B"}},
             title={"text": title, "font": {"size": 12, "color": "#6B7280"}},
             gauge={
-                "axis": {"range": [lo, hi], "ticksuffix": suffix,
-                          "tickfont": {"size": 10}, "nticks": 4},
+                "axis": {
+                    "range": [lo, hi],
+                    "ticksuffix": suffix,
+                    "tickfont": {"size": 10},
+                    "nticks": 4
+                },
                 "bar": {"color": "#1B4FD8", "thickness": 0.28},
                 "bgcolor": "white",
                 "borderwidth": 0,
                 "steps": [
-                    {"range": [lo,  mid],    "color": "#FEE2E2"},
+                    {"range": [lo, mid], "color": "#FEE2E2"},
                     {"range": [mid, target], "color": "#FEF3C7"},
-                    {"range": [target, hi],  "color": "#D1FAE5"},
+                    {"range": [target, hi], "color": "#D1FAE5"},
                 ],
                 "threshold": {
-                    "line": {"color": "#059669", "width": 2},
-                    "thickness": 0.8,
+                    "line": {"color": "#059669", "width": 8},
+                    "thickness": 0.9,
                     "value": target,
                 },
             },
         ))
+
         fig.update_layout(
-            height=280, paper_bgcolor="#FFFFFF",
+            height=280,
+            paper_bgcolor="#FFFFFF",
             margin=dict(l=20, r=20, t=40, b=10),
         )
+
         return fig
 
     with g1:
@@ -2266,7 +2486,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         )
     with g2:
         st.plotly_chart(
-            _gauge_fig(_pct_coll, "Collection Rate", 90, 100, THR["collection_rate"]),
+            _gauge_fig(_pct_coll, "Collection Rate", 80, 100, THR["collection_rate"]),
             width="stretch",
         )
     with g3:
@@ -2307,7 +2527,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 
     # ── Row B: Leasing activity KPIs | Vacancy pipeline | This month ─────
     _month_lbl  = _ah_now.strftime('%B %Y')
-    _mtd_label  = f"{_ah_now.strftime('%b')} 1–{_ah_now.strftime('%-d')}"  # e.g. "May 1–7"
+    _mtd_label = f"{_ah_now.strftime('%b')} 1–{_ah_now.day}"  # e.g. "May 1–7"
     col_f, col_p, col_w = st.columns(3)
 
     # Monthly move-ins from tickler (the only source with exact event dates)
@@ -2373,7 +2593,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             if calls_meta and calls_meta.get("start") and calls_meta.get("end"):
                 _cs = calls_meta["start"]
                 _ce = calls_meta["end"]
-                _calls_period = f" ({_cs.strftime('%b %-d')}–{_ce.strftime('%-d')})" if _cs.month == _ce.month else f" ({_cs.strftime('%b %-d')}–{_ce.strftime('%b %-d')})"
+                _calls_period = f"{_cs.strftime('%b')} {_cs.day}–{_ce.day}" if _cs.month == _ce.month else f"{_cs.strftime('%b')} {_cs.day}–{_ce.strftime('%b')} {_ce.day}"
             _week  += [
                 (f"Calls handled{_calls_period}", int(df_calls["Total Calls"].sum()), "#1B4FD8"),
                 ("Missed call rate",              f"{_mbp}%", "#DC2626" if _mbp > 5 else "#059669"),
@@ -2681,20 +2901,28 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 
         _calls_period_lbl = ""
         if calls_meta and calls_meta.get("start") and calls_meta.get("end"):
-            _cs = calls_meta["start"]; _ce = calls_meta["end"]
-            _calls_period_lbl = f" · {_cs.strftime('%b %-d')}–{_ce.strftime('%-d, %Y')}" if _cs.month == _ce.month \
-                                 else f" · {_cs.strftime('%b %-d')}–{_ce.strftime('%b %-d, %Y')}"
+            _cs = calls_meta["start"]
+            _ce = calls_meta["end"]
+
+            if _cs.month == _ce.month:
+                _calls_period_lbl = f" · {_cs.strftime('%b')} {_cs.day}–{_ce.day}, {_ce.year}"
+            else:
+                _calls_period_lbl = f" · {_cs.strftime('%b')} {_cs.day}, {_cs.year}–{_ce.strftime('%b')} {_ce.day}, {_ce.year}"
 
         _cc1, _cc2, _cc3, _cc4 = st.columns(4)
-        with _cc1: st.markdown(kpi("Total Calls" + _calls_period_lbl, f"{_tc_total:,}",
-                                    sub="Phone team combined"), unsafe_allow_html=True)
-        with _cc2: st.markdown(kpi("Inbound", f"{_tc_in:,}",
-                                    sub=f"{round(_tc_in/_tc_total*100) if _tc_total else 0}% of total"), unsafe_allow_html=True)
-        with _cc3: st.markdown(kpi("Outbound", f"{_tc_out:,}",
-                                    sub=f"{round(_tc_out/_tc_total*100) if _tc_total else 0}% of total"), unsafe_allow_html=True)
-        with _cc4: st.markdown(kpi("Missed / VM", f"{_tc_miss_pct:.1f}%",
-                                    status="bad" if _tc_miss_pct > 10 else "warn" if _tc_miss_pct > 5 else "good",
-                                    sub=f"{_tc_miss:,} calls missed with voicemail"), unsafe_allow_html=True)
+        with _cc1:
+            st.markdown(kpi("Total Calls" + _calls_period_lbl, f"{_tc_total:,}", sub="Phone team combined"), unsafe_allow_html=True)
+        with _cc2:
+            st.markdown(kpi("Inbound", f"{_tc_in:,}", sub=f"{round(_tc_in/_tc_total*100) if _tc_total else 0}% of total"), unsafe_allow_html=True)
+        with _cc3:
+            st.markdown(kpi("Outbound", f"{_tc_out:,}", sub=f"{round(_tc_out/_tc_total*100) if _tc_total else 0}% of total"), unsafe_allow_html=True)
+        with _cc4:
+            st.markdown(kpi(
+                "Missed / VM",
+                f"{_tc_miss_pct:.1f}%",
+                status="bad" if _tc_miss_pct > 10 else "warn" if _tc_miss_pct > 5 else "good",
+                sub=f"{_tc_miss:,} calls missed with voicemail"
+            ), unsafe_allow_html=True)
 
         # Per-agent breakdown chart (phone team only, sorted by total)
         _calls_chart_df = _df_phone.copy()
@@ -2735,35 +2963,66 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             st.plotly_chart(_ca_fig, width="stretch")
 
     # ── Row E: Occupancy trend ────────────────────────────────────────────
-    if df_hist is not None and len(df_hist) >= 2:
+    if df_hist is not None and len(df_hist) >= 2:   
         section("Occupancy Trend — Last 6 Months")
         fig_ah = go.Figure()
+
+        df_hist = df_hist.copy()
+
+    # Normalizar columnas por si viene de _historical() o load_historical_metrics()
+        df_hist = df_hist.rename(columns={
+            "date": "Date",
+            "physical_occupancy": "Physical Occupancy",
+            "economic_occupancy": "Economic Occupancy",
+        })
+
+        df_hist["snapshot_date"] = pd.to_datetime(df_hist["Date"], errors="coerce")
+        df_hist = df_hist.dropna(subset=["snapshot_date"])
+
         fig_ah.add_trace(go.Scatter(
-            x=df_hist["Date"],
+            x=df_hist["snapshot_date"],
             y=pd.to_numeric(df_hist["Physical Occupancy"], errors="coerce"),
-            name="Physical Occ %", line=dict(color=PC, width=3),
-            mode="lines+markers", marker=dict(size=7),
-            fill="tozeroy", fillcolor="rgba(27,79,216,0.07)",
+            name="Physical Occ %",
+            line=dict(color=PC, width=3),
+            mode="lines+markers",
+            marker=dict(size=7),
+            fill="tozeroy",
+            fillcolor="rgba(27,79,216,0.07)",
         ))
+
         fig_ah.add_trace(go.Scatter(
-            x=df_hist["Date"],
+            x=df_hist["snapshot_date"],
             y=pd.to_numeric(df_hist["Economic Occupancy"], errors="coerce"),
-            name="Economic Occ %", line=dict(color="#059669", width=3),
-            mode="lines+markers", marker=dict(size=7),
+            name="Economic Occ %",
+            line=dict(color="#059669", width=3),
+            mode="lines+markers",
+            marker=dict(size=7),
         ))
+
         fig_ah.add_hline(
-            y=THR["physical_occ"], line_dash="dot", line_color="#DC2626",
+            y=THR["physical_occ"],
+            line_dash="dot",
+            line_color="#DC2626",
             annotation_text=f"{THR['physical_occ']}% target",
             annotation_font=dict(size=10),
         )
+
         fig_ah.update_layout(
-            template="dfm", height=260,
-            yaxis=dict(title="Occupancy %", ticksuffix="%", range=[85, 100], gridcolor="#F1F5F9"),
+            template="dfm",
+            height=260,
+            yaxis=dict(
+                title="Occupancy %",
+                ticksuffix="%",
+                range=[85, 100],
+                gridcolor="#F1F5F9"
+            ),
             xaxis=dict(gridcolor="#F1F5F9"),
-            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
             legend=dict(orientation="h", y=-0.25),
             margin=dict(l=0, r=0, t=10, b=40),
         )
+
         st.plotly_chart(fig_ah, width="stretch")
 
 
@@ -2795,6 +3054,9 @@ if st.session_state.page == "Overview":
             if sum_rent > 0:
                 pct_collected = max(0, min(100, (sum_rent - pd_sum) / sum_rent * 100))
 
+    if sum_rent > 0:
+        pct_collected = max(0, min(100, (sum_rent - pd_sum) / sum_rent * 100))
+
     # Renewal rate
     renewal_rate = 0.0
     if df_renew_f is not None and "Status" in df_renew_f.columns:
@@ -2802,26 +3064,41 @@ if st.session_state.page == "Overview":
         if len(actionable):
             renewal_rate = len(actionable[actionable["Status"] == "Renewed"]) / len(actionable) * 100
 
+   
     # Historical deltas — only meaningful when no portfolio filter is active,
     # because df_hist stores all-portfolio numbers and _phys_occ/_econ_occ would
     # be portfolio-specific, making the delta apples-to-oranges.
     delta_phys = delta_econ = None
     _prev_date_label = "prior snapshot"
+
+    delta_phys = delta_econ = None
+    _prev_date_label = "prior snapshot"
+
     if df_hist is not None and len(df_hist) >= 2 and not SEL:
         prev = df_hist.iloc[-2]
+
         try:
-            delta_phys = _phys_occ - float(prev["Physical Occupancy"])
-            delta_econ = _econ_occ - float(prev["Economic Occupancy"])
-            _prev_dt = pd.to_datetime(prev.get("Date", None), errors="coerce")
+            prev_phys = pd.to_numeric(prev.get("physical_occupancy", None), errors="coerce")
+            prev_econ = pd.to_numeric(prev.get("economic_occupancy", None), errors="coerce")
+            _prev_dt = pd.to_datetime(prev.get("date", None), errors="coerce")
+
+            if pd.notna(prev_phys):
+                delta_phys = _phys_occ - float(prev_phys)
+
+            if pd.notna(prev_econ):
+                delta_econ = _econ_occ - float(prev_econ)
+
             if pd.notna(_prev_dt):
                 days_ago = (pd.Timestamp.now().normalize() - _prev_dt.normalize()).days
+
                 if days_ago == 1:
                     _prev_date_label = "yesterday"
                 elif days_ago == 0:
                     _prev_date_label = "earlier today"
                 else:
-                    _prev_date_label = _prev_dt.strftime("%-m/%-d")
-        except (ValueError, TypeError) as e:
+                    _prev_date_label = f"{_prev_dt.month}/{_prev_dt.day}"
+
+        except Exception as e:
             log.debug("historical delta calc: %s", e)
 
     # ── KPI Groups ────────────────────────────────────────────────────────
@@ -2890,83 +3167,170 @@ if st.session_state.page == "Overview":
             st.info("No events in the next 14 days.")
 
     # ── Historical trends ─────────────────────────────────────────────────
+    # ── Historical trends ─────────────────────────────────────────────────
     section("Historical Trends")
-    if df_hist is None or len(df_hist) < 2:
-        st.info("Historical trend will accumulate with each weekly data refresh.")
-    else:
-        _ht = df_hist.copy()
-        for _c in ["Physical Occupancy","Economic Occupancy","Collection Rate",
-                   "Vacant Units","Signed Leases","Inquiries","Showings"]:
-            if _c in _ht.columns:
-                _ht[_c] = pd.to_numeric(_ht[_c], errors="coerce")
 
-        _trend_tab, = st.tabs(["Occupancy  |  Collection  |  Leasing"])  # visual separator
-        # Use radio for cleaner look
-        _view = st.radio("View", ["Occupancy", "Collection Rate", "Leasing Activity"],
-                         horizontal=True, label_visibility="collapsed")
+    df_hist = load_historical_metrics()
+    df_ph = df_hist.copy()
+
+    df_ph = df_ph.rename(columns={"date": "snapshot_date"})
+
+    st.write("Historical metrics rows:", len(df_hist))
+    st.dataframe(df_hist.tail())
+
+    def trend_delta(df, col):
+        if df is None or len(df) < 2 or col not in df.columns:
+            return None
+
+        vals = pd.to_numeric(df[col], errors="coerce").dropna()
+
+        if len(vals) < 2:
+            return None
+
+        return vals.iloc[-1] - vals.iloc[-2]
+
+
+    occ_delta  = trend_delta(df_ph, "physical_occupancy")
+    econ_delta = trend_delta(df_ph, "economic_occupancy")
+    coll_delta = trend_delta(df_ph, "collection_rate")
+
+    if df_ph is None or df_ph.empty:
+        st.info("Historical trend will accumulate with each data refresh.")
+    else:
+        df_ph = df_ph.copy()
+
+    if "snapshot_date" not in df_ph.columns and "date" in df_ph.columns:
+        df_ph = df_ph.rename(columns={"date": "snapshot_date"})
+
+    df_ph["snapshot_date"] = pd.to_datetime(df_ph["snapshot_date"], errors="coerce")
+    df_ph = df_ph.dropna(subset=["snapshot_date"])
+    df_ph["snapshot_date"] = df_ph["snapshot_date"].dt.date
+    df_ph = df_ph.drop_duplicates(subset=["snapshot_date"], keep="last")
+    df_ph = df_ph.sort_values("snapshot_date")
+
+    if df_ph["snapshot_date"].nunique() < 2:
+        st.info("Historical trend will accumulate with each data refresh.")
+    else:
+        for col in [
+            "physical_occupancy",
+            "economic_occupancy",
+            "collection_rate",
+            "vacant_units",
+            "sum_of_rent",
+        ]:
+            if col in df_ph.columns:
+                df_ph[col] = pd.to_numeric(df_ph[col], errors="coerce")
+
+        _view = st.radio(
+            "View",
+            ["Occupancy", "Collection", "Vacancy / Rent"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
 
         fig_ht = go.Figure()
+
         if _view == "Occupancy":
-            if "Physical Occupancy" in _ht.columns:
-                fig_ht.add_trace(go.Scatter(x=_ht["Date"], y=_ht["Physical Occupancy"],
-                    name="Physical Occ %", line=dict(color=PC, width=2.5),
-                    mode="lines+markers", marker=dict(size=6),
-                    fill="tozeroy", fillcolor="rgba(27,79,216,0.05)"))
-            if "Economic Occupancy" in _ht.columns:
-                fig_ht.add_trace(go.Scatter(x=_ht["Date"], y=_ht["Economic Occupancy"],
-                    name="Economic Occ %", line=dict(color="#059669", width=2.5),
-                    mode="lines+markers", marker=dict(size=6)))
-            if "Vacant Units" in _ht.columns:
-                fig_ht.add_trace(go.Bar(x=_ht["Date"], y=_ht["Vacant Units"],
-                    name="Vacant Units", marker_color="rgba(220,38,38,0.15)",
-                    yaxis="y2"))
-            fig_ht.add_hline(y=THR["physical_occ"], line_dash="dot", line_color="#DC2626",
-                             annotation_text=f"Target {THR['physical_occ']}%", annotation_position="right")
-            fig_ht.update_layout(
-                yaxis=dict(title="Occupancy %", ticksuffix="%", range=[80,100], gridcolor="#F1F5F9"),
-                yaxis2=dict(title="Vacant Units", overlaying="y", side="right",
-                            showgrid=False, rangemode="tozero"),
+            fig_ht.add_trace(go.Scatter(
+                x=df_ph["snapshot_date"],
+                y=df_ph["physical_occupancy"],
+                name="Physical Occupancy",
+                mode="lines+markers",
+                line=dict(color=PC, width=2.5),
+            ))
+
+            fig_ht.add_trace(go.Scatter(
+                x=df_ph["snapshot_date"],
+                y=df_ph["economic_occupancy"],
+                name="Economic Occupancy",
+                mode="lines+markers",
+                line=dict(color="#059669", width=2.5),
+            ))
+
+            fig_ht.add_hline(
+                y=THR["physical_occ"],
+                line_dash="dot",
+                line_color="#DC2626",
+                annotation_text=f"Target {THR['physical_occ']}%",
+                annotation_position="right",
             )
 
-        elif _view == "Collection Rate":
-            if "Collection Rate" in _ht.columns:
-                _has_cr = _ht["Collection Rate"].dropna()
-                if len(_has_cr):
-                    fig_ht.add_trace(go.Scatter(x=_ht["Date"], y=_ht["Collection Rate"],
-                        name="Collection Rate %", line=dict(color="#059669", width=2.5),
-                        mode="lines+markers", marker=dict(size=6),
-                        fill="tozeroy", fillcolor="rgba(5,150,105,0.05)"))
-                    fig_ht.add_hline(y=THR["collection_rate"], line_dash="dot", line_color="#DC2626",
-                                     annotation_text=f"Target {THR['collection_rate']}%", annotation_position="right")
-                    fig_ht.update_layout(
-                        yaxis=dict(title="Collection Rate %", ticksuffix="%", range=[90,100], gridcolor="#F1F5F9"))
-                else:
-                    st.info("Collection Rate history will appear after the next data refresh.")
-            else:
-                st.info("Collection Rate history will appear after the next data refresh.")
-
-        else:  # Leasing Activity
-            _leasing_cols = [("Signed Leases","#059669"), ("Inquiries","#1B4FD8"), ("Showings","#7C3AED")]
-            for _lc, _lcolor in _leasing_cols:
-                if _lc in _ht.columns and _ht[_lc].dropna().sum() > 0:
-                    fig_ht.add_trace(go.Bar(x=_ht["Date"], y=_ht[_lc],
-                        name=_lc, marker_color=_lcolor, opacity=0.85))
             fig_ht.update_layout(
-                barmode="group",
-                yaxis=dict(title="Count", gridcolor="#F1F5F9", rangemode="tozero"),
+                yaxis=dict(title="Occupancy %", ticksuffix="%", range=[80, 100]),
+            )
+
+        elif _view == "Collection":
+            fig_ht.add_trace(go.Scatter(
+                x=df_ph["snapshot_date"],
+                y=df_ph["collection_rate"],
+                name="Collection Rate",
+                mode="lines+markers",
+                line=dict(color="#059669", width=2.5),
+            ))
+
+            fig_ht.add_hline(
+                y=THR["collection_rate"],
+                line_dash="dot",
+                line_color="#DC2626",
+                annotation_text=f"Target {THR['collection_rate']}%",
+                annotation_position="right",
+            )
+
+            fig_ht.update_layout(
+                yaxis=dict(title="Collection Rate %", ticksuffix="%", range=[0, 100]),
+            )
+
+        else:
+            fig_ht.add_trace(go.Bar(
+                x=df_ph["snapshot_date"],
+                y=df_ph["vacant_units"],
+                name="Vacant Units",
+                marker_color="#DC2626",
+                opacity=0.75,
+            ))
+
+            fig_ht.add_trace(go.Scatter(
+                x=df_ph["snapshot_date"],
+                y=df_ph["sum_of_rent"],
+                name="Sum of Rent",
+                mode="lines+markers",
+                line=dict(color="#D97706", width=2.5),
+                yaxis="y2",
+            ))
+
+            fig_ht.update_layout(
+                yaxis=dict(title="Vacant Units", rangemode="tozero"),
+                yaxis2=dict(
+                    title="Sum of Rent ($)",
+                    overlaying="y",
+                    side="right",
+                    tickprefix="$",
+                    showgrid=False,
+                ),
             )
 
         fig_ht.update_layout(
-            template="dfm", height=300,
-            xaxis=dict(gridcolor="#F1F5F9"),
-            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-            legend=dict(orientation="h", y=-0.28),
+            template="dfm",
+            height=330,
+            xaxis=dict(title="", gridcolor="#F1F5F9"),
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
+            legend=dict(orientation="h", y=-0.25),
             margin=dict(l=0, r=80, t=10, b=50),
         )
+
         st.plotly_chart(fig_ht, width="stretch")
+
+        
 
     # ── Top 5 Properties by Vacant Units ─────────────────────────────────
     section("Top 5 Properties by Vacant Units")
+
+    df_metrics["Vacant-Unrented"] = pd.to_numeric(
+        df_metrics["Vacant-Unrented"],
+        errors="coerce"
+    ).fillna(0)
+
     top5 = (df_metrics_f[["Property","Vacant-Unrented","Total Units","Physical Occ %","Revenue Gap ($)"]]
             .nlargest(5, "Vacant-Unrented").copy())
     top5.columns = ["Property","Vacant Units","Total Units","Physical Occ %","Revenue at Risk"]
@@ -3295,7 +3659,8 @@ elif st.session_state.page == "Vacancy":
 elif st.session_state.page == "Leasing":
     _leasing_snap = _latest_snapshot("leasing_funnel") or ""
     try:
-        _leasing_snap_lbl = pd.to_datetime(_leasing_snap).strftime("%b %-d, %Y")
+        _dt = pd.to_datetime(_leasing_snap)
+        _leasing_snap_lbl = f"{_dt.strftime('%b')} {_dt.day}, {_dt.year}"
     except Exception:
         _leasing_snap_lbl = _leasing_snap
     page_header("Leasing", f"AppFolio report · {_leasing_snap_lbl}")
@@ -3376,6 +3741,7 @@ elif st.session_state.page == "Leasing":
 
     # ── Applications ──────────────────────────────────────────────────────
     section(f"Application Pipeline · {_leasing_snap_lbl}")
+    st.write("Applications rows:", 0 if df_apps_f is None else len(df_apps_f))
     if df_apps_f is not None and len(df_apps_f):
         col_st, col_src = st.columns(2)
         with col_st:
@@ -3412,6 +3778,7 @@ elif st.session_state.page == "Leasing":
 
     # ── Lead Quality ──────────────────────────────────────────────────────
     section("Active Lead Quality")
+    
     if df_leads_f is not None and len(df_leads_f):
         active = df_leads_f[df_leads_f["Status"].astype(str).str.lower() == "active"].copy()
         if len(active):
@@ -3427,10 +3794,27 @@ elif st.session_state.page == "Leasing":
                                 status="bad" if avg_score < 40 else ("warn" if avg_score < 70 else "good"),
                                 sub=f"Quality: {score_label}"),
                             unsafe_allow_html=True)
-            _raw_inc = active["Monthly Income"].mean() if "Monthly Income" in active.columns else 0
-            avg_inc = float(_raw_inc) if pd.notna(_raw_inc) else 0.0
-            with c3: st.markdown(kpi("Avg Monthly Income", f"${avg_inc:,.0f}",
-                                      sub="Active leads · monthly gross income"), unsafe_allow_html=True)
+            
+            avg_inc = 0
+
+            if "Monthly Income" in active.columns:
+                _income = active.loc[
+                    active["Monthly Income"] > 0,
+                    "Monthly Income"
+                ]
+
+            if len(_income):
+                avg_inc = float(_income.median())
+
+            with c3:
+                st.markdown(
+                    kpi(
+                        "Avg Monthly Income",
+                        f"${avg_inc:,.0f}",
+                        sub="Active leads · monthly gross income"
+                    ),
+                unsafe_allow_html=True
+                )
 
             with st.expander(f"How is Lead Score calculated?  ·  Current avg: {avg_score:.0f}/100 — {score_label}", expanded=False):
                 st.markdown(f"""
@@ -3626,8 +4010,31 @@ elif st.session_state.page == "Collection":
     collected = billed - past_due
     pct_c     = max(0.0, min(100.0, (collected / billed * 100) if billed > 0 else 0.0))
 
-    st.caption(
-        "Source: Rent Roll · Current tenants only · Includes all charge types across all aging periods"
+    section8_billed = 0
+    section8_receivable = 0
+    section8_collected = 0
+
+    _s8 = pd.DataFrame()
+
+    if df_aged_f is not None and "GL Account Name" in df_aged_f.columns:
+        _s8 = df_aged_f[
+            df_aged_f["GL Account Name"]
+            .astype(str)
+            .str.contains("section 8", case=False, na=False)
+        ].copy()
+
+    if "Total Amount" in _s8.columns:
+        section8_billed = _s8["Total Amount"].sum()
+
+    if "Amount Receivable" in _s8.columns:
+        section8_receivable = _s8["Amount Receivable"].sum()
+
+    section8_collected = section8_billed - section8_receivable
+
+    section8_collection_rate = (
+        section8_collected / section8_billed
+        if section8_billed > 0
+        else 0
     )
 
     c1,c2,c3 = st.columns(3)
@@ -3639,6 +4046,71 @@ elif st.session_state.page == "Collection":
                               status=_tl(pct_c, THR["collection_rate"]),
                               sub="Past Due from rent roll · All ages · Current tenants only"),
                          unsafe_allow_html=True)
+
+    
+#================SECTION 8 PERFORMANCE ============================
+
+    st.markdown(
+        """
+        <div style="
+            font-size:10px;
+            font-weight:800;
+            letter-spacing:2.5px;
+            text-transform:uppercase;
+            color:#64748b;
+            margin-top:18px;
+            margin-bottom:12px;
+        ">
+            ▌ Section 8 Performance
+        </div>
+        """,
+        unsafe_allow_html=True
+        )
+
+    s8c1, s8c2, s8c3, s8c4 = st.columns(4)
+
+    with s8c1:
+        st.markdown(
+            kpi(
+                "Section 8 Billed",
+                f"${section8_billed:,.0f}",
+                sub="Total Section 8 charges"
+            ),
+            unsafe_allow_html=True
+        )
+
+    with s8c2:
+        st.markdown(
+            kpi(
+                "Section 8 Collected",
+                f"${section8_collected:,.0f}",
+                status="good" if section8_collected >= 0 else "bad",
+                sub="Billed minus receivable"
+            ),
+            unsafe_allow_html=True
+        )
+
+    with s8c3:
+        st.markdown(
+            kpi(
+                "Section 8 Receivable",
+                f"${section8_receivable:,.0f}",
+                status="warn" if section8_receivable > 0 else "good",
+                sub="Outstanding Section 8 balance"
+            ),
+            unsafe_allow_html=True
+        )
+
+    with s8c4:
+        st.markdown(
+            kpi(
+                "Collection Rate",
+                f"{section8_collection_rate:.1%}",
+                status="good" if section8_collection_rate >= 0.95 else "warn",
+                sub="Section 8 collected vs billed"
+            ),
+            unsafe_allow_html=True
+        )
 
     section("% Collected by Property")
     if "Past Due" not in df_c.columns:
@@ -3660,6 +4132,7 @@ elif st.session_state.page == "Collection":
             if fn(p): return color
         return "#166534"
 
+    
     # ── Bracket filter ────────────────────────────────────────────────────
     bracket_counts = {label: int((prop_c["pct"].apply(fn)).sum())
                       for label, (_, fn) in _COLL_BRACKETS.items()}
@@ -3733,6 +4206,7 @@ elif st.session_state.page == "Delinquency":
         st.warning("aged_receivable_detail-*.csv not found.")
         st.stop()
 
+    
     # ── Controls row ─────────────────────────────────────────────────────
     ctrl_l, ctrl_r = st.columns([2, 2])
 
@@ -3748,22 +4222,21 @@ elif st.session_state.page == "Delinquency":
                 "All Periods: full accumulated balance (includes 91+ days)."
             ),
         )
-
+  
     with ctrl_r:
-        if "GL Account Name" in df_aged_f.columns:
-            all_gl = sorted(df_aged_f["GL Account Name"].dropna().unique().tolist())
-            default_gl = [g for g in all_gl if "rental income" in g.lower()] or all_gl[:1]
-            with st.expander("⚙️  Filter by GL Account", expanded=False):
-                st.caption("Select which charge types to include.")
-                sel_gl = st.multiselect("GL Accounts", options=all_gl, default=default_gl,
-                                        label_visibility="collapsed")
-            if not sel_gl:
-                st.info("Select at least one GL Account above.")
-                st.stop()
-            df_d = df_aged_f[df_aged_f["GL Account Name"].isin(sel_gl)].copy()
-        else:
-            sel_gl = []
-            df_d = df_aged_f.copy()
+        st.caption("Showing Rental Income, Section 8, and Late Fees only.")
+
+    if "GL Account Name" in df_aged_f.columns:
+        _gl = df_aged_f["GL Account Name"].astype(str).str.lower()
+
+        df_d = df_aged_f[
+            _gl.str.contains("rental income", na=False) |
+            _gl.str.contains("late fee", na=False) |
+            _gl.str.contains("section 8", na=False)
+        ].copy()
+
+    else:
+        df_d = df_aged_f.copy()
 
     # Build a computed column based on the selected period
     if aging_mode == "0–30 days":
@@ -3788,10 +4261,26 @@ elif st.session_state.page == "Delinquency":
         use_all_aging = True
 
     amount_col = "_period_amt"
-
     if "GL Account Name" in df_d.columns:
-        is_rent = df_d["GL Account Name"].str.contains("Rental Income", case=False, na=False)
-        is_late = df_d["GL Account Name"].str.contains("Late fee",      case=False, na=False)
+        is_rent = df_d["GL Account Name"].astype(str).str.contains(
+            "Rental Income",
+            case=False,
+            na=False
+        )
+
+        is_late = df_d["GL Account Name"].astype(str).str.contains(
+            "Late fee",
+            case=False,
+            na=False
+        )
+
+        is_section8 = df_d["GL Account Name"].astype(str).str.contains(
+            "Section 8",
+            case=False,
+            na=False
+        )
+        
+
     else:
         is_rent = pd.Series(False, index=df_d.index)
         is_late = pd.Series(False, index=df_d.index)
@@ -3800,6 +4289,20 @@ elif st.session_state.page == "Delinquency":
     n_delinq  = df_d[df_d[amount_col] > 0]["Payer Name"].nunique()
     rent_amt  = df_d.loc[is_rent, amount_col].sum()
     late_amt  = df_d.loc[is_late, amount_col].sum()
+    section8_amt = df_d.loc[is_section8, amount_col].sum()
+
+       
+    total_rental_income = (
+        df_rr_f["Rent"].sum()
+    if df_rr_f is not None and "Rent" in df_rr_f.columns
+    else 0
+    )
+    delinq_rate = (total_pd / total_rental_income * 100) if total_rental_income > 0 else 0
+
+    unit_207_mask = df_d["Payer Name"].astype(str).str.lower().str.contains("damian, jennifer|jennifer damian", na=False)
+
+    unit_207_amt = df_d.loc[unit_207_mask, amount_col].sum()
+    adjusted_past_due = total_pd - unit_207_amt
 
     src_note = (
         f"Source: Aged Receivable · All tenant statuses (current, notice, eviction, former) · Period: {aging_label}"
@@ -3812,15 +4315,30 @@ elif st.session_state.page == "Delinquency":
         f"full exposure across all GL accounts: ${df_d['Amount Receivable'].sum():,.0f}."
     )
 
-    c1,c2,c3,c4 = st.columns(4)
+     
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: st.markdown(kpi("Total Past Due", f"${total_pd:,.0f}", status="bad",
-                              sub=aging_label), unsafe_allow_html=True)
+            sub=f"Current view: {aging_label}"),unsafe_allow_html=True)
     with c2: st.markdown(kpi("Delinquent Tenants", f"{n_delinq:,}",
-                              sub="With balance in selected view"), unsafe_allow_html=True)
+                          sub="With balance in selected view"), unsafe_allow_html=True)
     with c3: st.markdown(kpi("Rental Income", f"${rent_amt:,.0f}",
-                              sub=aging_label), unsafe_allow_html=True)
-    with c4: st.markdown(kpi("Late Fees", f"${late_amt:,.0f}",
-                              sub=aging_label), unsafe_allow_html=True)
+                          sub=aging_label), unsafe_allow_html=True)
+    with c4: st.markdown(kpi("Section 8", f"${section8_amt:,.0f}",
+                          sub=aging_label), unsafe_allow_html=True)
+    with c5: st.markdown(kpi("Late Fees", f"${late_amt:,.0f}",
+                          sub=aging_label), unsafe_allow_html=True)
+    with c6: st.markdown(kpi("Delinquency Rate", f"{delinq_rate:.1f}%", status="bad" if delinq_rate > 5 else "warn" if delinq_rate > 3 else "good",
+            sub=f"Current view: {aging_label}"),unsafe_allow_html=True)
+
+    c7, c8 = st.columns(2)
+
+    with c7: st.markdown(kpi("Adjusted Past Due", f"${adjusted_past_due:,.0f}",
+            sub=f"Excludes Unit 207: ${unit_207_amt:,.0f}"),unsafe_allow_html=True)
+
+    st.write("DEBUG Total Past Due:", total_pd)
+    st.write("DEBUG Delinquency Rate:", delinq_rate)
+    st.write("DEBUG Aging Mode:", aging_mode)
+
 
     # ── Aging breakdown ───────────────────────────────────────────────────
     section("Past Due Aging Breakdown")
@@ -3855,6 +4373,23 @@ elif st.session_state.page == "Delinquency":
         margin=dict(l=0, r=0, t=10, b=40),
     )
     st.plotly_chart(fig_ag, width="stretch")
+
+    is_rent = df_d["GL Account Name"].astype(str).str.contains(
+        "Rental Income",
+        case=False,
+        na=False
+    )       
+
+    is_late = df_d["GL Account Name"].astype(str).str.contains(
+        "Late fees",
+        case=False,
+        na=False
+    )
+
+    amount_col = "_period_amt"
+
+    rent_amt = df_d.loc[is_rent, amount_col].sum()
+    late_amt = df_d.loc[is_late, amount_col].sum()
 
     # ── Top 10 Properties ─────────────────────────────────────────────────
     section(f"Top 10 Properties by Past Due · {aging_label}")
@@ -3969,6 +4504,13 @@ elif st.session_state.page == "Operations/Maintenance":
 
     df_w = df_wo_f.copy()
 
+ 
+    if "Created At" in df_w.columns:
+        df_w["Created At"] = pd.to_datetime(
+            df_w["Created At"],
+            errors="coerce"
+        )
+
     # ── Month filter ──────────────────────────────────────────────────────
     if "Created At" in df_w.columns and df_w["Created At"].notna().any():
         wo_months = df_w["Created At"].dt.to_period("M")
@@ -4050,7 +4592,10 @@ elif st.session_state.page == "Operations/Maintenance":
                 pri_avg = (df_comp_p.groupby("Priority")["Days to Resolve"]
                                .agg(["mean","count"]).reset_index()
                                .rename(columns={"mean":"Avg Days","count":"# WOs"}))
-                pri_avg["Avg Days"] = pri_avg["Avg Days"].round(1)
+                pri_avg["Avg Days"] = pd.to_numeric(
+                    pri_avg["Avg Days"],
+                    errors="coerce"
+                ).fillna(0).round(1)
                 color_map = {"Normal":PC,"Urgent":"#F59E0B","Emergency":"#DC2626"}
                 fig_pri = px.bar(pri_avg, x="Priority", y="Avg Days",
                                  color="Priority",
@@ -4080,36 +4625,58 @@ elif st.session_state.page == "Operations/Maintenance":
 
         if "Vendor" in df_w.columns:
             section("Vendor Scorecard")
-            _ven_df = df_w[df_w["Vendor"].notna() & (df_w["Vendor"].astype(str).str.strip() != "")].copy()
+
+            _ven_df = df_w[
+                df_w["Vendor"].notna()
+                & (df_w["Vendor"].astype(str).str.strip() != "")
+                & (df_w["Vendor"].astype(str).str.lower() != "none")
+            ].copy()
+
             _ven_df["Vendor"] = _ven_df["Vendor"].astype(str).str.strip()
-            _ven_grp = _ven_df.groupby("Vendor")
-            _sc = _ven_grp["Status"].count().rename("WOs").reset_index()
-            # % completed
-            _comp_mask = _ven_df["Status"].astype(str).str.lower().str.contains("completed", na=False)
-            _sc_comp = _ven_df[_comp_mask].groupby("Vendor")["Status"].count().rename("Completed").reset_index()
-            _sc = _sc.merge(_sc_comp, on="Vendor", how="left")
-            _sc["Completed"] = _sc["Completed"].fillna(0).astype(int)
-            _sc["% Done"] = (_sc["Completed"] / _sc["WOs"] * 100).round(0).astype(int)
-            # avg days to resolve
-            if "Days to Resolve" in _ven_df.columns:
-                _sc_res = (_ven_df[_comp_mask]
-                           .groupby("Vendor")["Days to Resolve"]
-                           .mean().round(1).rename("Avg Days").reset_index())
-                _sc = _sc.merge(_sc_res, on="Vendor", how="left")
+
+            if len(_ven_df) == 0:
+                st.info("No vendor data available.")
             else:
-                _sc["Avg Days"] = float("nan")
-            # total cost
-            if "Amount" in _ven_df.columns:
-                _sc_cost = _ven_df.groupby("Vendor")["Amount"].sum().rename("Total Cost").reset_index()
-                _sc = _sc.merge(_sc_cost, on="Vendor", how="left")
-                _sc["Total Cost $"] = _sc["Total Cost"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
-            _sc = _sc.sort_values("WOs", ascending=False).head(10).reset_index(drop=True)
-            _sc_disp = _sc[["Vendor","WOs","Completed","% Done","Avg Days"] +
-                           (["Total Cost $"] if "Total Cost $" in _sc.columns else [])].copy()
-            _sc_disp["Avg Days"] = _sc_disp["Avg Days"].map(lambda x: f"{x:.1f}d" if pd.notna(x) else "—")
-            c_v, c_dv = st.columns([3, 1])
-            with c_v:  st.dataframe(_sc_disp, width="stretch", hide_index=True)
-            with c_dv: download_btn(_sc_disp, "vendor_scorecard.csv")
+                _ven_df["Days to Resolve"] = pd.to_numeric(
+                    _ven_df.get("Days to Resolve"),
+                    errors="coerce"
+                )
+
+                _ven_df["Amount"] = pd.to_numeric(
+                    _ven_df.get("Amount"),
+                    errors="coerce"
+                ).fillna(0)
+
+                _sc = (
+                    _ven_df
+                    .groupby("Vendor")
+                    .agg(
+                        WOs=("Status", "count"),
+                        Completed=("Status", lambda x: x.astype(str).str.lower().str.contains("completed", na=False).sum()),
+                        Avg_Days=("Days to Resolve", "mean"),
+                        Total_Cost=("Amount", "sum"),
+                    )
+                    .reset_index()
+                )
+
+                _sc["% Done"] = (_sc["Completed"] / _sc["WOs"] * 100).fillna(0).round(0).astype(int)
+                _sc["Avg Days"] = pd.to_numeric(_sc["Avg_Days"], errors="coerce").fillna(0).round(1)
+                _sc["Total Cost $"] = _sc["Total_Cost"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
+
+                _sc_disp = (
+                    _sc[["Vendor", "WOs", "Completed", "% Done", "Avg Days", "Total Cost $"]]
+                    .sort_values("WOs", ascending=False)
+                    .head(10)
+                    .copy()
+                )
+
+                _sc_disp["Avg Days"] = _sc_disp["Avg Days"].map(lambda x: f"{x:.1f}d")
+
+                c_v, c_dv = st.columns([3, 1])
+                with c_v:
+                    st.dataframe(_sc_disp, width="stretch", hide_index=True)
+                with c_dv:
+                    download_btn(_sc_disp, "vendor_scorecard.csv")
 
         st.markdown("<br>", unsafe_allow_html=True)
 

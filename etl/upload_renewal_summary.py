@@ -7,21 +7,11 @@ SUPABASE_KEY = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-csv_file = r"data/raw/work_order.csv"
-from datetime import date
-snapshot_date = date.today().isoformat()
+csv_file = r"data/raw/renewal_summary.csv"
+snapshot_date = "2026-06-11"
 
 df = pd.read_csv(csv_file)
 df.columns = [c.strip() for c in df.columns]
-
-def calc_days_to_resolve(created_at, completed_on):
-    start = pd.to_datetime(created_at, errors="coerce")
-    end = pd.to_datetime(completed_on, errors="coerce")
-
-    if pd.isna(start) or pd.isna(end):
-        return None
-
-    return float((end - start).days)
 
 
 def clean_text(value):
@@ -54,22 +44,15 @@ for _, row in df.iterrows():
     records.append({
         "snapshot_date": snapshot_date,
         "property": clean_text(row.get("Property")),
-        "unit": clean_text(row.get("Unit")),
+        "unit_id": clean_text(row.get("Unit ID")),
+        "tenant_name": clean_text(row.get("Tenant Name")),
         "status": clean_text(row.get("Status")),
-        "priority": clean_text(row.get("Priority")),
-        "amount": clean_money(row.get("Amount")),
-        "created_at": clean_text(row.get("Created At")),
-        "completed_on": clean_text(row.get("Completed On")),
-        "days_to_resolve": calc_days_to_resolve(
-            row.get("Created At"),
-            row.get("Completed On")
-        ),
-        "work_order_issue": clean_text(row.get("Work Order Issue")),
-        "vendor": clean_text(row.get("Vendor")),
-        "work_order_type": clean_text(row.get("Work Order Type")),
+        "previous_rent": clean_money(row.get("Previous Rent")),
+        "rent": clean_money(row.get("Rent")),
+        "percent_difference": clean_number(row.get("Percent Difference")),
     })
 
-supabase.table("work_orders").delete().eq("snapshot_date", snapshot_date).execute()
-supabase.table("work_orders").insert(records).execute()
+supabase.table("renewal_summary").delete().eq("snapshot_date", snapshot_date).execute()
+supabase.table("renewal_summary").insert(records).execute()
 
-print(f"Uploaded {len(records)} work order rows")
+print(f"Uploaded {len(records)} renewal summary rows")

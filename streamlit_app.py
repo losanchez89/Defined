@@ -3,7 +3,7 @@ import streamlit as st
 st.title("Defined")
 """
 Property Management Executive Dashboard — Streamlit
-Defined Property Management · v2.0
+Defined Property Management
 """
 
 import io
@@ -2963,7 +2963,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             st.plotly_chart(_ca_fig, width="stretch")
 
     # ── Row E: Occupancy trend ────────────────────────────────────────────
-    if df_hist is not None and len(df_hist) >= 2:   
+    if df_hist is not None and len(df_hist) >= 15:   
         section("Occupancy Trend — Last 6 Months")
         fig_ah = go.Figure()
 
@@ -3208,7 +3208,7 @@ if st.session_state.page == "Overview":
     df_ph = df_ph.drop_duplicates(subset=["snapshot_date"], keep="last")
     df_ph = df_ph.sort_values("snapshot_date")
 
-    if df_ph["snapshot_date"].nunique() < 2:
+    if df_ph["snapshot_date"].nunique() < 15:
         st.info("Historical trend will accumulate with each data refresh.")
     else:
         for col in [
@@ -3319,7 +3319,10 @@ if st.session_state.page == "Overview":
             margin=dict(l=0, r=80, t=10, b=50),
         )
 
-        st.plotly_chart(fig_ht, width="stretch")
+        if _view == "Vacancy / Rent" and len(df_ph) < 15:
+            st.info("Historical trend will be available once more historical data has been collected.")
+        else:
+            st.plotly_chart(fig_ht, use_container_width=True)
 
         
 

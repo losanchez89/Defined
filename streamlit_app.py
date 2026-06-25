@@ -4227,7 +4227,7 @@ elif st.session_state.page == "Delinquency":
         )
   
     with ctrl_r:
-        st.caption("Showing Rental Income, Section 8, and Late Fees only.")
+        st.empty()
 
     if "GL Account Name" in df_aged_f.columns:
         _gl = df_aged_f["GL Account Name"].astype(str).str.lower()
@@ -4306,19 +4306,7 @@ elif st.session_state.page == "Delinquency":
 
     unit_207_amt = df_d.loc[unit_207_mask, amount_col].sum()
     adjusted_past_due = total_pd - unit_207_amt
-
-    src_note = (
-        f"Source: Aged Receivable · All tenant statuses (current, notice, eviction, former) · Period: {aging_label}"
-    )
-    st.caption(src_note)
-
-    st.caption(
-        "Collection tab = Current tenants only (Rent Roll · Past Due).  "
-        "Delinquency = All statuses (current, notice, eviction, former) per Aged Receivable report — "
-        f"full exposure across all GL accounts: ${df_d['Amount Receivable'].sum():,.0f}."
-    )
-
-     
+   
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: st.markdown(kpi("Total Past Due", f"${total_pd:,.0f}", status="bad",
             sub=f"Current view: {aging_label}"),unsafe_allow_html=True)
@@ -4337,11 +4325,6 @@ elif st.session_state.page == "Delinquency":
 
     with c7: st.markdown(kpi("Adjusted Past Due", f"${adjusted_past_due:,.0f}",
             sub=f"Excludes Unit 207: ${unit_207_amt:,.0f}"),unsafe_allow_html=True)
-
-    st.write("DEBUG Total Past Due:", total_pd)
-    st.write("DEBUG Delinquency Rate:", delinq_rate)
-    st.write("DEBUG Aging Mode:", aging_mode)
-
 
     # ── Aging breakdown ───────────────────────────────────────────────────
     section("Past Due Aging Breakdown")

@@ -607,8 +607,9 @@ def load_config() -> dict:
             "wo_resolution_days": 7,
         },
         "phone_team": [
-            "Chonalyn", "Nicole", "Alejandro", "Andrea",
+            "Chonalyn", "Nichole", "Alejandro", "Andrea",
             "Norman", "Inés", "Ines", "Lorena", "Carmen",
+            "Laura", "Sergei"
         ],
     }
     p = Path(__file__).parent / "config.yaml"
@@ -2037,8 +2038,7 @@ with st.sidebar:
         st.markdown(
             f'<div style="background:#1B4FD8;padding:14px 12px;border-radius:8px;margin-bottom:4px;">'
             f'<span style="color:#fff;font-size:18px;font-weight:800;letter-spacing:0.5px;">Defined</span>'
-            f'<span style="color:#93C5FD;font-size:18px;font-weight:400;"> Property</span><br>'
-            f'<span style="color:#DBEAFE;font-size:11px;font-weight:500;letter-spacing:1px;">MANAGEMENT</span>'
+            f'<span style="color:#DBEAFE;font-size:11px;font-weight:500;letter-spacing:1px;">  PROPERTY MANAGEMENT</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -2368,7 +2368,7 @@ if st.session_state.page == "All Hands":
   <div class="card"><div class="card-label">Total Vacancies</div><div class="card-val">{_vu+_vr+_nu_val:,}</div><div class="card-sub">{_vu} unrented · {_vr} rented · {_nu_val} on notice</div></div>
   <div class="card"><div class="card-label">Vacant Unrented</div><div class="card-val">{_vu:,}</div></div>
   <div class="card"><div class="card-label">In Eviction</div><div class="card-val">{_ev_val:,}</div></div>
-  <div class="card"><div class="card-label">Revenue at Risk</div><div class="card-val">${_rgap:,.0f}</div></div>
+  <div class="card"><div class="card-label">Potential Monthly Revenue Loss</div><div class="card-val">${_rgap:,.0f}</div></div>
 </div>
 
 <h2>Leasing</h2>
@@ -3175,9 +3175,6 @@ if st.session_state.page == "Overview":
 
     df_ph = df_ph.rename(columns={"date": "snapshot_date"})
 
-    st.write("Historical metrics rows:", len(df_hist))
-    st.dataframe(df_hist.tail())
-
     def trend_delta(df, col):
         if df is None or len(df) < 2 or col not in df.columns:
             return None
@@ -3208,9 +3205,7 @@ if st.session_state.page == "Overview":
     df_ph = df_ph.drop_duplicates(subset=["snapshot_date"], keep="last")
     df_ph = df_ph.sort_values("snapshot_date")
 
-    if df_ph["snapshot_date"].nunique() < 15:
-        st.info("Historical trend will accumulate with each data refresh.")
-    else:
+    if df_ph["snapshot_date"].nunique() >= 15:
         for col in [
             "physical_occupancy",
             "economic_occupancy",
@@ -3319,10 +3314,7 @@ if st.session_state.page == "Overview":
             margin=dict(l=0, r=80, t=10, b=50),
         )
 
-        if _view == "Vacancy / Rent" and len(df_ph) < 15:
-            st.info("Historical trend will be available once more historical data has been collected.")
-        else:
-            st.plotly_chart(fig_ht, use_container_width=True)
+        st.plotly_chart(fig_ht, use_container_width=True)
 
         
 
@@ -3744,7 +3736,6 @@ elif st.session_state.page == "Leasing":
 
     # ── Applications ──────────────────────────────────────────────────────
     section(f"Application Pipeline · {_leasing_snap_lbl}")
-    st.write("Applications rows:", 0 if df_apps_f is None else len(df_apps_f))
     if df_apps_f is not None and len(df_apps_f):
         col_st, col_src = st.columns(2)
         with col_st:
@@ -4226,9 +4217,6 @@ elif st.session_state.page == "Delinquency":
             ),
         )
   
-    with ctrl_r:
-        st.empty()
-
     if "GL Account Name" in df_aged_f.columns:
         _gl = df_aged_f["GL Account Name"].astype(str).str.lower()
 
@@ -4324,7 +4312,7 @@ elif st.session_state.page == "Delinquency":
     c7, c8 = st.columns(2)
 
     with c7: st.markdown(kpi("Adjusted Past Due", f"${adjusted_past_due:,.0f}",
-            sub=f"Excludes Unit 207: ${unit_207_amt:,.0f}"),unsafe_allow_html=True)
+            sub=f"Excludes 10020 Zelzah Unit 207: ${unit_207_amt:,.0f}"),unsafe_allow_html=True)
 
     # ── Aging breakdown ───────────────────────────────────────────────────
     section("Past Due Aging Breakdown")

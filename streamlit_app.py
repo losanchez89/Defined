@@ -2460,7 +2460,9 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                 )
 
             except Exception as e:
-                st.error("PDF Error")
+                import traceback
+                st.error("PDF export error")
+            st.code(traceback.format_exc())
 
     # ── Portfolio Banner ───────────────────────────────────────────────────
     st.markdown(

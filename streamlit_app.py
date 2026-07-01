@@ -2400,7 +2400,8 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         import asyncio
         import tempfile
         from pathlib import Path
-
+        from playwright.sync_api import sync_playwright
+        
         if sys.platform.startswith("win"):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 

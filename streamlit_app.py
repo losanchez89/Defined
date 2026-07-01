@@ -2395,75 +2395,16 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 </body>
 </html>"""
 
-    def _build_report_pdf() -> bytes:
-        import sys
-        import asyncio
-        import tempfile
-        from pathlib import Path
-        from playwright.sync_api import sync_playwright
-        
-        if sys.platform.startswith("win"):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-        from playwright.sync_api import sync_playwright
-
-        html = _build_report_html()
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as f:
-            f.write(html)
-            html_path = f.name
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(Path(html_path).as_uri(), wait_until="load")
-
-            pdf_bytes = page.pdf(
-                format="Letter",
-                print_background=True,
-                margin={
-                    "top": "0.4in",
-                    "right": "0.4in",
-                    "bottom": "0.4in",
-                    "left": "0.4in",
-                },
-            )
-
-            browser.close()
-
-        return pdf_bytes
-
     with _ah_col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
-        _report_html = _build_report_html()
 
-        b1, b2 = st.columns(2)
-
-        with b1:
-            st.download_button(
-                "🌐 HTML",
-                data=_report_html,
-                file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.html",
-                mime="text/html",
-                use_container_width=True,
-            )
-
-        with b2:
-            try:
-                _report_pdf = _build_report_pdf()
-
-                st.download_button(
-                    "📄 PDF",
-                    data=_report_pdf,
-                    file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            except Exception as e:
-                import traceback
-                st.error("PDF export error")
-                st.code(traceback.format_exc())
+        st.download_button(
+            "Export Report",
+            data=_build_report_html(),
+            file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.html",
+            mime="text/html",
+            type="secondary",
+        )
 
     # ── Portfolio Banner ───────────────────────────────────────────────────
     st.markdown(

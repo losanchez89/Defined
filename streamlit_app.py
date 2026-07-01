@@ -12,6 +12,8 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 
 import pandas as pd
 import plotly.express as px
@@ -2207,7 +2209,7 @@ else:
 # ============================================================================
 
 if st.session_state.page == "All Hands":
-    _ah_date = datetime.now().strftime('%B %d, %Y')
+    _ah_date = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y")
     _ah_col_hdr, _ah_col_btn = st.columns([5, 1])
     with _ah_col_hdr:
         page_header("All Hands Meeting", f"Monthly Company Snapshot  ·  {_ah_date}")
@@ -2395,15 +2397,71 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 </body>
 </html>"""
 
+    def _build_report_pdf() -> bytes:
+        import sys
+        import asyncio
+        import tempfile
+        from pathlib import Path
+
+        if sys.platform.startswith("win"):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+        from playwright.sync_api import sync_playwright
+
+        html = _build_report_html()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as f:
+            f.write(html)
+            html_path = f.name
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(Path(html_path).as_uri(), wait_until="load")
+
+            pdf_bytes = page.pdf(
+                format="Letter",
+                print_background=True,
+                margin={
+                    "top": "0.4in",
+                    "right": "0.4in",
+                    "bottom": "0.4in",
+                    "left": "0.4in",
+                },
+            )
+
+            browser.close()
+
+        return pdf_bytes
+
     with _ah_col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
-        st.download_button(
-            "Export Report",
-            data=_build_report_html(),
-            file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.html",
-            mime="text/html",
-            type="secondary",
-        )
+        _report_html = _build_report_html()
+        b1, b2 = st.columns(2)
+
+        with b1:
+            st.download_button(
+                "🌐 HTML",
+                data=_report_html,
+                file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.html",
+                mime="text/html",
+                use_container_width=True,
+            )
+
+        with b2:
+            try:
+                _report_pdf = _build_report_pdf()
+
+                st.download_button(
+                    "📄 PDF",
+                    data=_report_pdf,
+                    file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+
+            except Exception as e:
+                st.error("PDF Error")
 
     # ── Portfolio Banner ───────────────────────────────────────────────────
     st.markdown(

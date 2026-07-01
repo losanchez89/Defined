@@ -6,3 +6,4 @@ supabase
 openpyxl
 numpy
 python-dateutil
+playwright

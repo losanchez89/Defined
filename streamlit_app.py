@@ -2209,7 +2209,12 @@ else:
 # ============================================================================
 
 if st.session_state.page == "All Hands":
-    _ah_date = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y")
+    _snap = _latest_snapshot("rent_roll")
+    _ah_date = (
+        pd.to_datetime(_snap).strftime("%B %d, %Y")
+        if _snap
+        else datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%B %d, %Y")
+    )
     _ah_col_hdr, _ah_col_btn = st.columns([5, 1])
     with _ah_col_hdr:
         page_header("All Hands Meeting", f"Monthly Company Snapshot  ·  {_ah_date}")

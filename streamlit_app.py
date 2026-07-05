@@ -1134,19 +1134,32 @@ def _monthly_leasing(year: int, month: int) -> dict:
     import calendar as _cal
 
     # ── Primary: read from pre-computed table ────────────────────────────
+    # ── Primary: read from pre-computed table ────────────────────────────
     try:
-        rows = supabase.table("monthly_leasing")\
-            .select("showings_completed,applications_received,leases_signed,inquiries")\
-            .eq("year", year).eq("month", month)\
-            .order("snapshot_date", desc=True).limit(1).execute().data
+        rows = (
+            supabase.table("monthly_leasing")
+            .select("showings_completed,applications_received,leases_signed,inquiries")
+            .eq("year", year)
+            .eq("month", month)
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+            .data
+        )
+
         if rows:
             r = rows[0]
-            return {
-                "showings_completed": int(r.get("showings_completed") or 0),
-                "applications":       int(r.get("applications_received") or 0),
-                "leases_signed":      int(r.get("leases_signed") or 0),
-                "inquiries":          int(r.get("inquiries") or 0),
-            }
+
+            # Si la tabla monthly_leasing tiene datos válidos, usarlos.
+            # Si showings_completed es 0, usar el cálculo fallback.
+            if int(r.get("showings_completed") or 0) > 0:
+                return {
+                    "showings_completed": int(r.get("showings_completed") or 0),
+                    "applications": int(r.get("applications_received") or 0),
+                    "leases_signed": int(r.get("leases_signed") or 0),
+                    "inquiries": int(r.get("inquiries") or 0),
+                }
+
     except Exception:
         pass  # table not yet created — fall through to live query
 
@@ -2261,11 +2274,30 @@ if st.session_state.page == "All Hands":
 
     # Query true monthly data across all snapshots (deduplicated)
     _monthly = _monthly_leasing(_ah_year, _ah_month)
-    _shows      = _monthly["showings_completed"] or int(_totals.get("Completed Showings", 0))
-    _apps_count = _monthly["applications"]       or (int(df_funnel_f["Rental Apps"].sum()) if df_funnel_f is not None and "Rental Apps" in df_funnel_f.columns else 0)
-    _leased     = _monthly["leases_signed"]      or leasing_summary.get("Leased", int(_totals.get("Signed Leases", 0)))
-    _inq        = _monthly.get("inquiries") or int(_totals.get("Inquiries", 0))
 
+    _shows = (
+        leasing_summary.get("Showings", 0)
+        or _monthly.get("showings_completed", 0)
+        or int(_totals.get("Completed Showings", 0))
+    )
+
+    _apps_count = (
+        leasing_summary.get("Applications", 0)
+        or _monthly.get("applications", 0)
+        or (int(df_funnel_f["Rental Apps"].sum()) if df_funnel_f is not None and "Rental Apps" in df_funnel_f.columns else 0)
+    )
+
+    _leased = (
+        leasing_summary.get("Leased", 0)
+        or _monthly.get("leases_signed", 0)
+        or int(_totals.get("Signed Leases", 0))
+    )
+
+    _inq = (
+        leasing_summary.get("Inquiries", 0)
+        or _monthly.get("inquiries", 0)
+        or int(_totals.get("Inquiries", 0))
+    )
     # ── Alertas automáticas vs. snapshot anterior ─────────────────────────
     if df_hist is not None and len(df_hist) >= 2:
         _prev_snap = df_hist.iloc[-2]

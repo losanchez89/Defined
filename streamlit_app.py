@@ -2624,11 +2624,11 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                 .reset_index()
             )
             _prop_c2 = _prop_c2[(_prop_c2["billed"] > 0) & (_prop_c2["past_due"] > 0)]
-            _prop_c2 = _prop_c2.nlargest(15, "past_due").sort_values("past_due", ascending=True)
+            _prop_c2 = _prop_c2.nlargest(5, "past_due").sort_values("past_due", ascending=True)
 
             if len(_prop_c2):
                 _prop_c2["pct"] = ((_prop_c2["billed"] - _prop_c2["past_due"]) / _prop_c2["billed"] * 100).clip(0, 100)
-                section("Top 15 Past Due · Current Tenants")
+                section("Top 5 Past Due · Current Tenants")
 
                 def _ccol2(p):
                     if p < 85:   return "#991B1B"

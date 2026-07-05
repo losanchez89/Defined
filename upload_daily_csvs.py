@@ -520,6 +520,20 @@ def upload_leasing_funnel():
     df = pd.read_csv(fp)
     snapshot_date = date.today().strftime("%Y-%m-%d")
 
+    df.columns = [c.strip() for c in df.columns]
+
+    # Eliminar filas de totales o subtotales
+    df = df[
+        df["Property"].notna()
+    ]
+
+    df = df[
+        ~df["Property"].astype(str).str.strip().str.lower().str.contains(
+            "total|subtotal|signed leases", na=False
+        )
+    ]
+
+
     df = df.rename(columns={
         "Property": "property",
         "Inquiries": "inquiries",
@@ -558,25 +572,43 @@ def upload_leasing_summary():
         return
 
     print(f"Found leasing_summary file: {fp}")
-    df = pd.read_csv(fp)
-    snapshot_date = date.today().strftime("%Y-%m-%d")
 
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    df = pd.read_csv(fp, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+
+    snapshot_date = SNAPSHOT_DATE
+
+    def clean_int(value):
+        if pd.isna(value):
+            return 0
+        number = pd.to_numeric(value, errors="coerce")
+        return 0 if pd.isna(number) else int(number)
+
+    # Tomar solo la fila Total
+    total_row = df[
+        df["Unit Type"].astype(str).str.strip().str.lower() == "total"
+    ]
+
+    if len(total_row) == 0:
+        raise Exception("Total row not found in leasing_summary")
+
+    row = total_row.iloc[0]
 
     summary = {
         "snapshot_date": snapshot_date,
-        "leased": int(pd.to_numeric(df.get("leased", pd.Series([0])).sum(), errors="coerce") or 0),
-        "move_ins": int(pd.to_numeric(df.get("move_ins", pd.Series([0])).sum(), errors="coerce") or 0),
-        "move_outs": int(pd.to_numeric(df.get("move_outs", pd.Series([0])).sum(), errors="coerce") or 0),
-        "inquiries": int(pd.to_numeric(df.get("inquiries", pd.Series([0])).sum(), errors="coerce") or 0),
-        "showings": int(pd.to_numeric(df.get("showings", pd.Series([0])).sum(), errors="coerce") or 0),
-        "applications": int(pd.to_numeric(df.get("applications", pd.Series([0])).sum(), errors="coerce") or 0),
+        "leased": clean_int(row.get("Leased")),
+        "move_ins": clean_int(row.get("Move Ins")),
+        "move_outs": clean_int(row.get("Move Outs")),
+        "inquiries": clean_int(row.get("Interests Received")),
+        "showings": clean_int(row.get("Showings Completed")),
+        "applications": clean_int(row.get("Applications Received")),
     }
 
     supabase.table("leasing_summary").delete().eq("snapshot_date", snapshot_date).execute()
     supabase.table("leasing_summary").insert(summary).execute()
 
     print(f"Uploaded leasing_summary for {snapshot_date}")
+    print(summary)
 
 #=================================================
 #====unit_vacancy_detail======================

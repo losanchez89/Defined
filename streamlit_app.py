@@ -2519,7 +2519,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         )
     with g2:
         st.plotly_chart(
-            _gauge_fig(_pct_coll, "Collection Rate", 80, 100, THR["collection_rate"]),
+            _gauge_fig(_pct_coll, "Collection Rate", 70, 100, THR["collection_rate"]),
             width="stretch",
         )
     with g3:

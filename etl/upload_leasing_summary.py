@@ -18,6 +18,7 @@ df.columns = [c.strip() for c in df.columns]
 def clean_int(value):
     if pd.isna(value):
         return 0
+    value = str(value).replace(",", "").strip()
     number = pd.to_numeric(value, errors="coerce")
     return 0 if pd.isna(number) else int(number)
 
@@ -29,6 +30,15 @@ if len(total_row) == 0:
     raise Exception("Total row not found")
 
 row = total_row.iloc[0]
+
+print("COLUMNAS:")
+print(df.columns.tolist())
+
+print("\nFILA TOTAL:")
+print(row)
+
+print("\nINTERESTS RECEIVED:")
+print(repr(row.get("Interests Received")))
 
 record = {
     "snapshot_date": snapshot_date,

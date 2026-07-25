@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import date
+from matplotlib.pylab import number
 import pandas as pd
 from streamlit import status
 from supabase_client import supabase
@@ -581,6 +582,9 @@ def upload_leasing_summary():
     def clean_int(value):
         if pd.isna(value):
             return 0
+
+        value = str(value).replace(",", "").strip()
+
         number = pd.to_numeric(value, errors="coerce")
         return 0 if pd.isna(number) else int(number)
 

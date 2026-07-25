@@ -7,6 +7,7 @@ Defined Property Management
 """
 
 import io
+import html
 import logging
 import os
 import re
@@ -1329,6 +1330,104 @@ def _aged_receivable():
         log.error("aged_receivable desde Supabase: %s", e)
         return None
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _delinquency():
+    """Load the AppFolio Delinquency report.
+
+    Supabase table ``delinquency`` is preferred when available. A local
+    ``delinquency*.csv`` file is used as a fallback so the dashboard can be
+    tested before the ETL/table is deployed.
+    """
+    expected = [
+        "Unit", "Name", "Tenant Status", "Tags", "Move In",
+        "Amount Receivable", "0-30", "30+", "60+", "90+",
+        "Last Payment", "Late Count", "Property", "Unit ID",
+    ]
+    try:
+        df = None
+        try:
+            snap = _latest_snapshot("delinquency")
+            if snap:
+                rows = _fetch_all("delinquency", snap)
+                if rows:
+                    df = pd.DataFrame(rows).rename(columns={
+                        "unit": "Unit",
+                        "name": "Name",
+                        "tenant_status": "Tenant Status",
+                        "tags": "Tags",
+                        "move_in": "Move In",
+                        "amount_receivable": "Amount Receivable",
+                        "d0_30": "0-30",
+                        "d30_plus": "30+",
+                        "d60_plus": "60+",
+                        "d90_plus": "90+",
+                        "last_payment": "Last Payment",
+                        "late_count": "Late Count",
+                        "property": "Property",
+                        "unit_id": "Unit ID",
+                    })
+        except Exception as e:
+            log.info("delinquency Supabase unavailable; using CSV fallback: %s", e)
+
+        if df is None:
+            # Local fallback: raw AppFolio exports live in data/raw/.
+            # Try the configured data folder first, then the project-standard
+            # data/raw path so local execution and Railway use the same layout.
+            search_dirs = [
+                DATA_DIR / "raw",
+                DATA_DIR,
+                Path(__file__).parent / "data" / "raw",
+            ]
+            fp = None
+            for folder in search_dirs:
+                if folder.exists():
+                    fp = find_csv_file(str(folder), "delinquency")
+                    if fp:
+                        break
+            if not fp:
+                return None
+            df = pd.read_csv(fp, dtype=str)
+
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            log.error("Delinquency report missing columns: %s", missing)
+            return None
+
+        df = df[expected].copy()
+
+        # Remove AppFolio summary/header rows.
+        # The final Total row has no property and would duplicate portfolio totals.
+        df["Property"] = df["Property"].fillna("").astype(str).str.strip()
+        df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+        df["Unit ID"] = df["Unit ID"].fillna("").astype(str).str.strip()
+
+        df = df[
+            (df["Property"] != "") &
+            (~df["Name"].str.fullmatch(r"(?i)total|totals?", na=False))
+        ].copy()
+        df["Property"] = df["Property"].apply(clean_property_name)
+        df["Property"] = df["Property"].apply(clean_property_name)
+        for col in ["Unit", "Name", "Tenant Status", "Tags"]:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+        for col in ["Amount Receivable", "0-30", "30+", "60+", "90+"]:
+            df[col] = clean_money_column(df[col])
+        df["Late Count"] = pd.to_numeric(df["Late Count"], errors="coerce").fillna(0).astype(int)
+        for col in ["Move In", "Last Payment"]:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # AppFolio's 30+, 60+, and 90+ columns are cumulative. Derive the
+        # mutually exclusive buckets used by charts and tables.
+        df["31-60"] = (df["30+"] - df["60+"]).clip(lower=0)
+        df["61-90"] = (df["60+"] - df["90+"]).clip(lower=0)
+        df["91+"] = df["90+"].clip(lower=0)
+        df = df[df["Amount Receivable"] > 0].copy()
+
+        return df.reset_index(drop=True)
+    except Exception as e:
+        log.error("delinquency report load failed: %s", e)
+        return None
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _work_orders():
     try:
@@ -1879,6 +1978,7 @@ with st.spinner("Loading portfolio data…"):
     df_metrics, totals, phys_occ, econ_occ = _metrics()
     df_hist     = _historical()
     df_aged     = _aged_receivable()
+    df_delinq    = _delinquency()
     df_vac      = _vacancy_detail()
     df_wo       = _work_orders()
     df_raw_show = _showings_raw()
@@ -2189,6 +2289,20 @@ df_rr_f      = _f(df_rr)
 df_metrics_f = _f(df_metrics)
 df_vac_f     = _f(df_vac)
 df_aged_f    = _f(df_aged)
+if df_delinq is not None and SEL:
+    _sel_delinq_keys = {
+        _norm_key(clean_property_name(p))
+        for p in SEL
+    }
+
+    df_delinq_f = df_delinq[
+        df_delinq["Property"]
+        .apply(clean_property_name)
+        .map(_norm_key)
+        .isin(_sel_delinq_keys)
+    ].copy()
+else:
+    df_delinq_f = df_delinq
 df_wo_f      = _f(df_wo)
 df_funnel_f  = _f(df_funnel)
 df_tickler_f = _f(df_tickler)
@@ -2273,31 +2387,10 @@ if st.session_state.page == "All Hands":
     _ah_month, _ah_year = _ah_now.month, _ah_now.year
 
     # Query true monthly data across all snapshots (deduplicated)
-    _monthly = _monthly_leasing(_ah_year, _ah_month)
-
-    _shows = (
-        leasing_summary.get("Showings", 0)
-        or _monthly.get("showings_completed", 0)
-        or int(_totals.get("Completed Showings", 0))
-    )
-
-    _apps_count = (
-        leasing_summary.get("Applications", 0)
-        or _monthly.get("applications", 0)
-        or (int(df_funnel_f["Rental Apps"].sum()) if df_funnel_f is not None and "Rental Apps" in df_funnel_f.columns else 0)
-    )
-
-    _leased = (
-        leasing_summary.get("Leased", 0)
-        or _monthly.get("leases_signed", 0)
-        or int(_totals.get("Signed Leases", 0))
-    )
-
-    _inq = (
-        leasing_summary.get("Inquiries", 0)
-        or _monthly.get("inquiries", 0)
-        or int(_totals.get("Inquiries", 0))
-    )
+    _shows = int(leasing_summary.get("Showings", 0))
+    _apps_count = int(leasing_summary.get("Applications", 0))
+    _leased = int(leasing_summary.get("Leased", 0))
+    _inq = int(leasing_summary.get("Inquiries", 0))
     # ── Alertas automáticas vs. snapshot anterior ─────────────────────────
     if df_hist is not None and len(df_hist) >= 2:
         _prev_snap = df_hist.iloc[-2]
@@ -2358,9 +2451,104 @@ if st.session_state.page == "All Hands":
         _ev_val  = int(_totals.get("Evict", 0))
         _notes_now = st.session_state.get("notes", [])
         _notes_html = "".join(
-            f'<li style="margin-bottom:4px;"><b>{n.get("timestamp","")}</b> — {n["content"]}</li>'
+            f'<li style="margin-bottom:4px;"><b>{html.escape(str(n.get("timestamp", "")))}</b> — '
+            f'{html.escape(str(n.get("content", "")))}</li>'
             for n in _notes_now
         ) or "<li>No notes added.</li>"
+
+        # ── Calls summary ─────────────────────────────────────────────────
+        _calls_total = _calls_inbound = _calls_outbound = _calls_missed = 0
+        _calls_avg_daily = 0.0
+        _calls_missed_pct = 0.0
+        _calls_period_text = "Latest available period"
+        _agents_rows_html = ""
+
+        if df_calls is not None and len(df_calls) > 0:
+            _calls_tbl = df_calls.copy()
+
+            # Keep only the configured phone team when names are available.
+            # Use partial matching because the report may include full names or extra text.
+            if "Name" in _calls_tbl.columns:
+                _phone_names = [str(n).strip().lower() for n in PHONE_TEAM]
+                _calls_tbl["_name_clean"] = (
+                    _calls_tbl["Name"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                )
+                _calls_tbl = _calls_tbl[
+                    _calls_tbl["_name_clean"].apply(
+                        lambda name: any(phone_name in name for phone_name in _phone_names)
+                    )
+                ].copy()
+                _calls_tbl.drop(columns=["_name_clean"], inplace=True, errors="ignore")
+
+            for _col in ["Total Calls", "Inbound", "Outbound", "Missed with VM", "Avg Daily"]:
+                if _col not in _calls_tbl.columns:
+                    _calls_tbl[_col] = 0
+                _calls_tbl[_col] = pd.to_numeric(_calls_tbl[_col], errors="coerce").fillna(0)
+
+            _calls_tbl = _calls_tbl[_calls_tbl["Total Calls"] > 0].copy()
+            _calls_total = int(_calls_tbl["Total Calls"].sum())
+            _calls_inbound = int(_calls_tbl["Inbound"].sum())
+            _calls_outbound = int(_calls_tbl["Outbound"].sum())
+            _calls_missed = int(_calls_tbl["Missed with VM"].sum())
+            _calls_avg_daily = float(_calls_tbl["Avg Daily"].sum())
+            _calls_missed_pct = (_calls_missed / _calls_inbound * 100
+                if _calls_inbound > 0
+                else 0.0
+        )
+
+            if calls_meta:
+                _ps = calls_meta.get("start")
+                _pe = calls_meta.get("end")
+                if pd.notna(_ps) and pd.notna(_pe):
+                    _calls_period_text = f"{pd.Timestamp(_ps).strftime('%b %d, %Y')} – {pd.Timestamp(_pe).strftime('%b %d, %Y')}"
+
+            _top_agents = _calls_tbl.sort_values("Total Calls", ascending=False).head(5)
+            _agents_rows_html = "".join(
+                "<tr>"
+                f"<td>{html.escape(str(r.get('Name', '')))}</td>"
+                f"<td>{int(r.get('Total Calls', 0) or 0):,}</td>"
+                f"<td>{int(r.get('Inbound', 0) or 0):,}</td>"
+                f"<td>{int(r.get('Outbound', 0) or 0):,}</td>"
+                f"<td>{int(r.get('Missed with VM', 0) or 0):,}</td>"
+                "</tr>"
+                for _, r in _top_agents.iterrows()
+            )
+
+        if not _agents_rows_html:
+            _agents_rows_html = '<tr><td colspan="5" class="empty">No call data available.</td></tr>'
+
+        # ── Top delinquencies ─────────────────────────────────────────────
+        _delinq_rows_html = ""
+        if df_aged_f is not None and len(df_aged_f) > 0:
+            _delinq_tbl = df_aged_f.copy()
+            if "Amount Receivable" not in _delinq_tbl.columns:
+                _delinq_tbl["Amount Receivable"] = 0
+            _delinq_tbl["Amount Receivable"] = pd.to_numeric(
+                _delinq_tbl["Amount Receivable"], errors="coerce"
+            ).fillna(0)
+            for _col in ["Property", "Payer Name"]:
+                if _col not in _delinq_tbl.columns:
+                    _delinq_tbl[_col] = ""
+            _delinq_tbl = (
+                _delinq_tbl.groupby(["Property", "Payer Name"], dropna=False)["Amount Receivable"]
+                .sum().reset_index()
+                .sort_values("Amount Receivable", ascending=False)
+                .head(10)
+            )
+            _delinq_rows_html = "".join(
+                "<tr>"
+                f"<td>{html.escape(str(r.get('Payer Name', '')))}</td>"
+                f"<td>{html.escape(str(r.get('Property', '')))}</td>"
+                f"<td>${float(r.get('Amount Receivable', 0) or 0):,.0f}</td>"
+                "</tr>"
+                for _, r in _delinq_tbl.iterrows()
+            )
+        if not _delinq_rows_html:
+            _delinq_rows_html = '<tr><td colspan="3" class="empty">No delinquency data available.</td></tr>'
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2380,6 +2568,16 @@ if st.session_state.page == "All Hands":
   .card-sub{{font-size:11px;color:#94A3B8;}}
   ul{{padding-left:18px;color:#374151;}}
   li{{margin-bottom:3px;font-size:12px;}}
+  .section-note{{font-size:10px;color:#94A3B8;margin:-6px 0 10px 0;}}
+  .calls-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;}}
+  .calls-grid .card{{padding:10px 12px;}}
+  .calls-grid .card-val{{font-size:20px;}}
+  .table-wrap{{border:1px solid #E2E8F0;border-radius:8px;overflow:hidden;margin-bottom:16px;}}
+  table{{width:100%;border-collapse:collapse;font-size:11px;}}
+  th{{background:#F1F5F9;color:#475569;text-align:left;text-transform:uppercase;letter-spacing:.06em;font-size:9px;padding:9px 10px;}}
+  td{{padding:8px 10px;border-top:1px solid #E2E8F0;color:#334155;}}
+  td:nth-last-child(-n+2){{white-space:nowrap;}}
+  .empty{{text-align:center;color:#94A3B8;padding:16px;}}
   @media print{{body{{padding:16px 20px;}}@page{{margin:1cm;}}}}
 </style>
 </head>
@@ -2416,6 +2614,46 @@ if st.session_state.page == "All Hands":
   <div class="card"><div class="card-label">Total</div><div class="card-val">{_wo_total:,}</div></div>
   <div class="card"><div class="card-label">Completed</div><div class="card-val">{_wo_completed:,}</div><div class="card-sub">{_wo_comp_pct:.0f}% completion</div></div>
   <div class="card"><div class="card-label">Open / In Progress</div><div class="card-val">{_wo_open:,}</div></div>
+</div>
+
+<h2>Communications — Calls</h2>
+<div class="section-note">{_calls_period_text} · Phone team only</div>
+<div class="calls-grid">
+  <div class="card">
+    <div class="card-label">Total Calls</div>
+    <div class="card-val">{_calls_total:,}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Inbound</div>
+    <div class="card-val">{_calls_inbound:,}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Outbound</div>
+    <div class="card-val">{_calls_outbound:,}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Missed Call Rate</div>
+    <div class="card-val">{_calls_missed_pct:.1f}%</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Avg Daily</div>
+    <div class="card-val">{_calls_avg_daily:,.0f}</div>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Top Agents</th><th>Total Calls</th><th>Inbound</th><th>Outbound</th><th>Missed with VM</th></tr></thead>
+<tbody>{_agents_rows_html}</tbody>
+</table>
+</div>
+
+<h2>Top Delinquencies</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Tenant</th><th>Property</th><th>Balance</th></tr></thead>
+<tbody>{_delinq_rows_html}</tbody>
+</table>
 </div>
 
 <h2>Notes</h2>
@@ -4229,274 +4467,367 @@ elif st.session_state.page == "Collection":
 elif st.session_state.page == "Delinquency":
     page_header("Delinquency", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
 
-    if df_aged_f is None:
-        st.warning("aged_receivable_detail-*.csv not found.")
+    if df_delinq_f is None:
+        st.warning(
+            "Delinquency report not found. Add delinquency*.csv to the data folder "
+            "or upload the report to the Supabase delinquency table."
+        )
         st.stop()
 
-    
-    # ── Controls row ─────────────────────────────────────────────────────
-    ctrl_l, ctrl_r = st.columns([2, 2])
-
+    # Page-only controls. Portfolio and Property remain in the sidebar.
+    ctrl_l, ctrl_r = st.columns([3, 2])
     with ctrl_l:
         aging_mode = st.radio(
             "Period",
-            options=["0–30 days", "0–60 days", "0–90 days", "91+ days", "All Periods"],
+            options=["0–30 days", "30+ days", "60+ days", "90+ days", "All Periods"],
             horizontal=True,
             help=(
-                "0–30 days: current month charges only.\n\n"
-                "0–60 days: cumulative 0–30 + 31–60.\n\n"
-                "0–90 days: cumulative 0–30 + 31–60 + 61–90.\n\n"
-                "All Periods: full accumulated balance (includes 91+ days)."
+                "Values match the cumulative aging columns in the AppFolio "
+                "Delinquency report: 0-30, 30+, 60+, 90+, and Amount Receivable."
             ),
-        )
-  
-    if "GL Account Name" in df_aged_f.columns:
-        _gl = df_aged_f["GL Account Name"].astype(str).str.lower()
-
-        df_d = df_aged_f[
-            _gl.str.contains("rental income", na=False) |
-            _gl.str.contains("late fee", na=False) |
-            _gl.str.contains("section 8", na=False)
-        ].copy()
-
-    else:
-        df_d = df_aged_f.copy()
-
-    # Build a computed column based on the selected period
-    if aging_mode == "0–30 days":
-        df_d["_period_amt"] = df_d["0-30"]
-        aging_label = "0–30 days"
-        use_all_aging = False
-    elif aging_mode == "0–60 days":
-        df_d["_period_amt"] = df_d["0-30"].fillna(0) + df_d["31-60"].fillna(0)
-        aging_label = "0–60 days"
-        use_all_aging = False
-    elif aging_mode == "0–90 days":
-        df_d["_period_amt"] = df_d["0-30"].fillna(0) + df_d["31-60"].fillna(0) + df_d["61-90"].fillna(0)
-        aging_label = "0–90 days"
-        use_all_aging = False
-    elif aging_mode == "91+ days":
-        df_d["_period_amt"] = df_d["91+"].fillna(0)
-        aging_label = "91+ days"
-        use_all_aging = False
-    else:  # All Periods
-        df_d["_period_amt"] = df_d["Amount Receivable"]
-        aging_label = "All Periods"
-        use_all_aging = True
-
-    amount_col = "_period_amt"
-    if "GL Account Name" in df_d.columns:
-        is_rent = df_d["GL Account Name"].astype(str).str.contains(
-            "Rental Income",
-            case=False,
-            na=False
+            key="delinquency_period",
         )
 
-        is_late = df_d["GL Account Name"].astype(str).str.contains(
-            "Late fee",
-            case=False,
-            na=False
+    with ctrl_r:
+        _preferred_statuses = [
+            "Current", "Notice-Rented", "Notice-Unrented",
+            "Evict", "Past Resident", "Past", "Notice", "Vacant-Rented",
+        ]
+        _status_values = set(
+            df_delinq_f["Tenant Status"].fillna("").astype(str).str.strip()
+        ) - {""}
+        _available_statuses = [
+            status for status in _preferred_statuses if status in _status_values
+        ]
+        _other_statuses = sorted(_status_values - set(_available_statuses))
+
+        resident_status = st.multiselect(
+            "Resident Status",
+            options=_available_statuses + _other_statuses,
+            default=[],
+            placeholder="All statuses",
+            help="Leave blank to include all resident statuses in the AppFolio report.",
+            key="delinquency_resident_status",
         )
 
-        is_section8 = df_d["GL Account Name"].astype(str).str.contains(
-            "Section 8",
-            case=False,
-            na=False
-        )
-        
+    # ------------------------------------------------------------------
+    # One filtered delinquency dataset is the source of truth for the page.
+    # ------------------------------------------------------------------
+    df_d = df_delinq_f.copy()
 
-    else:
-        is_rent = pd.Series(False, index=df_d.index)
-        is_late = pd.Series(False, index=df_d.index)
+    if resident_status:
+        df_d = df_d[df_d["Tenant Status"].isin(resident_status)].copy()
 
-    total_pd  = df_d[amount_col].sum()
-    n_delinq  = df_d[df_d[amount_col] > 0]["Payer Name"].nunique()
-    rent_amt  = df_d.loc[is_rent, amount_col].sum()
-    late_amt  = df_d.loc[is_late, amount_col].sum()
-    section8_amt = df_d.loc[is_section8, amount_col].sum()
+    # df_delinq_f was already filtered globally using clean_property_name +
+    # _norm_key. Do not filter a second time with the raw sidebar label because
+    # sidebar values may include the full address after " - ".
 
-       
-    total_rental_income = (
-        df_rr_f["Rent"].sum()
-    if df_rr_f is not None and "Rent" in df_rr_f.columns
-    else 0
+    _period_config = {
+        "0–30 days": ("0-30", "0–30 days"),
+        "30+ days": ("30+", "30+ days"),
+        "60+ days": ("60+", "60+ days"),
+        "90+ days": ("90+", "90+ days"),
+        "All Periods": ("Amount Receivable", "All Periods"),
+    }
+    _period_col, aging_label = _period_config[aging_mode]
+    df_d["_period_amt"] = pd.to_numeric(
+        df_d[_period_col], errors="coerce"
+    ).fillna(0)
+    df_d = df_d[df_d["_period_amt"] > 0].copy()
+
+    if df_d.empty:
+        _status_text = ", ".join(resident_status) if resident_status else "all resident statuses"
+        if SEL and len(SEL) == 1:
+            st.success(
+                f"✅ **Property in Good Standing**\n\n"
+                f"{SEL[0]} has no delinquent residents for {aging_label.lower()} "
+                f"and {_status_text}."
+            )
+        else:
+            st.success(
+                f"✅ **No Delinquencies Found**\n\n"
+                f"No delinquent residents were found for {aging_label.lower()} "
+                f"and {_status_text}."
+            )
+        st.stop()
+
+    total_pd = float(df_d["_period_amt"].sum())
+    n_delinq = int(
+        df_d[["Property", "Unit ID", "Name"]].drop_duplicates().shape[0]
     )
-    delinq_rate = (total_pd / total_rental_income * 100) if total_rental_income > 0 else 0
 
-    unit_207_mask = df_d["Payer Name"].astype(str).str.lower().str.contains("damian, jennifer|jennifer damian", na=False)
+    # ------------------------------------------------------------------
+    # Charge-category KPIs from Aged Receivable Detail.
+    # This report carries GL-account detail that Delinquency does not.
+    # ------------------------------------------------------------------
+    rent_amt = 0.0
+    section8_amt = 0.0
+    late_amt = 0.0
 
-    unit_207_amt = df_d.loc[unit_207_mask, amount_col].sum()
-    adjusted_past_due = total_pd - unit_207_amt
-   
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
-    with c1: st.markdown(kpi("Total Past Due", f"${total_pd:,.0f}", status="bad",
-            sub=f"Current view: {aging_label}"),unsafe_allow_html=True)
-    with c2: st.markdown(kpi("Delinquent Tenants", f"{n_delinq:,}",
-                          sub="With balance in selected view"), unsafe_allow_html=True)
-    with c3: st.markdown(kpi("Rental Income", f"${rent_amt:,.0f}",
-                          sub=aging_label), unsafe_allow_html=True)
-    with c4: st.markdown(kpi("Section 8", f"${section8_amt:,.0f}",
-                          sub=aging_label), unsafe_allow_html=True)
-    with c5: st.markdown(kpi("Late Fees", f"${late_amt:,.0f}",
-                          sub=aging_label), unsafe_allow_html=True)
-    with c6: st.markdown(kpi("Delinquency Rate", f"{delinq_rate:.1f}%", status="bad" if delinq_rate > 5 else "warn" if delinq_rate > 3 else "good",
-            sub=f"Current view: {aging_label}"),unsafe_allow_html=True)
+    if (
+        df_aged_f is not None
+        and not df_aged_f.empty
+        and "GL Account Name" in df_aged_f.columns
+    ):
+        _charge = df_aged_f.copy()
 
-    c7, c8 = st.columns(2)
+        # Reapply property scope defensively using normalized names.
+        if SEL and "Property" in _charge.columns:
+            _selected_property_keys = {_norm_key(p) for p in SEL}
+            _charge = _charge[
+                _charge["Property"].map(_norm_key).isin(_selected_property_keys)
+            ].copy()
 
-    with c7: st.markdown(kpi("Adjusted Past Due", f"${adjusted_past_due:,.0f}",
-            sub=f"Excludes 10020 Zelzah Unit 207: ${unit_207_amt:,.0f}"),unsafe_allow_html=True)
+        def _money_series(frame, column):
+            if column not in frame.columns:
+                return pd.Series(0.0, index=frame.index)
+            return pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
 
-    # ── Aging breakdown ───────────────────────────────────────────────────
+        if aging_mode == "0–30 days":
+            _charge_amt = _money_series(_charge, "0-30")
+        elif aging_mode == "30+ days":
+            _charge_amt = (
+                _money_series(_charge, "31-60")
+                + _money_series(_charge, "61-90")
+                + _money_series(_charge, "91+")
+            )
+        elif aging_mode == "60+ days":
+            _charge_amt = (
+                _money_series(_charge, "61-90")
+                + _money_series(_charge, "91+")
+            )
+        elif aging_mode == "90+ days":
+            _charge_amt = _money_series(_charge, "91+")
+        else:
+            if "Amount Receivable" in _charge.columns:
+                _charge_amt = _money_series(_charge, "Amount Receivable")
+            else:
+                _charge_amt = (
+                    _money_series(_charge, "0-30")
+                    + _money_series(_charge, "31-60")
+                    + _money_series(_charge, "61-90")
+                    + _money_series(_charge, "91+")
+                )
+
+        _charge["_view_amt"] = _charge_amt
+        _gl = _charge["GL Account Name"].fillna("").astype(str)
+
+        rent_amt = float(
+            _charge.loc[
+                _gl.str.contains("Rental Income", case=False, na=False),
+                "_view_amt",
+            ].sum()
+        )
+        section8_amt = float(
+            _charge.loc[
+                _gl.str.contains("Section 8", case=False, na=False),
+                "_view_amt",
+            ].sum()
+        )
+        late_amt = float(
+            _charge.loc[
+                _gl.str.contains("Late Fee", case=False, na=False),
+                "_view_amt",
+            ].sum()
+        )
+
+    total_rental_income = (
+        float(pd.to_numeric(df_rr_f["Rent"], errors="coerce").fillna(0).sum())
+        if df_rr_f is not None and "Rent" in df_rr_f.columns
+        else 0.0
+    )
+    delinq_rate = (
+        total_pd / total_rental_income * 100
+        if total_rental_income > 0
+        else 0.0
+    )
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        st.markdown(
+            kpi(
+                "Total Past Due", f"${total_pd:,.0f}",
+                status="bad", sub=f"Current view: {aging_label}",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            kpi(
+                "Delinquent Residents", f"{n_delinq:,}",
+                sub="Unique property/unit/resident",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            kpi("Rental Income", f"${rent_amt:,.0f}", sub="Charge detail · property scope"),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            kpi("Section 8", f"${section8_amt:,.0f}", sub="Charge detail · property scope"),
+            unsafe_allow_html=True,
+        )
+    with c5:
+        st.markdown(
+            kpi("Late Fees", f"${late_amt:,.0f}", sub="Charge detail · property scope"),
+            unsafe_allow_html=True,
+        )
+    with c6:
+        st.markdown(
+            kpi(
+                "Delinquency Rate",
+                f"{delinq_rate:.1f}%",
+                status="bad" if delinq_rate > 5 else "warn" if delinq_rate > 3 else "good",
+                sub=f"{aging_label} ÷ scheduled rent",
+            ),
+            unsafe_allow_html=True,
+        )
+
     section("Past Due Aging Breakdown")
     aging = {
-        "0–30":  df_d["0-30"].sum(),
-        "31–60": df_d["31-60"].sum(),
-        "61–90": df_d["61-90"].sum(),
-        "91+":   df_d["91+"].sum(),
+        "0–30": float(df_d["0-30"].sum()),
+        "31–60": float(df_d["31-60"].sum()),
+        "61–90": float(df_d["61-90"].sum()),
+        "91+": float(df_d["91+"].sum()),
     }
-    # Highlight which buckets are active in the selected period
     bucket_active = {
-        "0–30 days":   [True,  False, False, False],
-        "0–60 days":   [True,  True,  False, False],
-        "0–90 days":   [True,  True,  True,  False],
-        "91+ days":    [False, False, False, True ],
-        "All Periods": [True,  True,  True,  True ],
+        "0–30 days": [True, False, False, False],
+        "30+ days": [False, True, True, True],
+        "60+ days": [False, False, True, True],
+        "90+ days": [False, False, False, True],
+        "All Periods": [True, True, True, True],
     }
-    active_mask = bucket_active.get(aging_mode, [True, True, True, True])
-    bar_opacities = [1.0 if a else 0.25 for a in active_mask]
+    _aging_colors = [PC, "#F59E0B", "#EF4444", "#7F1D1D"]
     fig_ag = go.Figure(go.Bar(
-        x=list(aging.keys()), y=list(aging.values()),
-        marker_color=[PC, "#F59E0B", "#EF4444", "#7F1D1D"],
-        marker_opacity=bar_opacities,
-        text=[f"${v:,.0f}" for v in aging.values()],
+        x=list(aging),
+        y=list(aging.values()),
+        marker_color=_aging_colors,
+        marker_opacity=[1.0 if active else 0.25 for active in bucket_active[aging_mode]],
+        text=[f"${value:,.0f}" for value in aging.values()],
         textposition="outside",
     ))
     fig_ag.update_layout(
-        template="dfm", height=290,
+        template="dfm",
+        height=290,
         yaxis=dict(title="Amount ($)", tickprefix="$", gridcolor="#F1F5F9"),
         xaxis=dict(title="Aging Bucket"),
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
         margin=dict(l=0, r=0, t=10, b=40),
     )
     st.plotly_chart(fig_ag, width="stretch")
 
-    is_rent = df_d["GL Account Name"].astype(str).str.contains(
-        "Rental Income",
-        case=False,
-        na=False
-    )       
-
-    is_late = df_d["GL Account Name"].astype(str).str.contains(
-        "Late fees",
-        case=False,
-        na=False
-    )
-
-    amount_col = "_period_amt"
-
-    rent_amt = df_d.loc[is_rent, amount_col].sum()
-    late_amt = df_d.loc[is_late, amount_col].sum()
-
-    # ── Top 10 Properties ─────────────────────────────────────────────────
     section(f"Top 10 Properties by Past Due · {aging_label}")
-    prop_d = (df_d.groupby("Property")[amount_col].sum().reset_index()
-                  .nlargest(10, amount_col).sort_values(amount_col, ascending=True))
-    prop_d = prop_d.rename(columns={amount_col: "_amt"})
-
-    # Identify Jennifer Damian (Unit 207 – Zelzah) as exceptional case
-    _jd_d_mask = df_d["Payer Name"].str.lower().str.contains("jennifer damian", na=False)
-    _jd_by_prop_d = df_d[_jd_d_mask].groupby("Property")[amount_col].sum().to_dict()
-    prop_d["_jd_amt"]     = prop_d["Property"].map(lambda p: _jd_by_prop_d.get(p, 0.0))
-    prop_d["_normal_amt"] = prop_d["_amt"] - prop_d["_jd_amt"]
-    _has_jd_d = (prop_d["_jd_amt"] > 0).any()
-
-    fig_pd = go.Figure()
-    fig_pd.add_trace(go.Bar(
-        x=prop_d["_normal_amt"], y=prop_d["Property"],
-        orientation="h", marker_color="#EF4444", name="Past Due",
-        text=prop_d.apply(lambda r: f"${r['_amt']:,.0f}" if r["_jd_amt"] == 0 else "", axis=1),
+    prop_d = (
+        df_d.groupby("Property", as_index=False)["_period_amt"]
+        .sum()
+        .nlargest(10, "_period_amt")
+        .sort_values("_period_amt")
+    )
+    fig_pd = go.Figure(go.Bar(
+        x=prop_d["_period_amt"],
+        y=prop_d["Property"],
+        orientation="h",
+        marker_color="#EF4444",
+        text=prop_d["_period_amt"].map(lambda value: f"${value:,.0f}"),
         textposition="outside",
     ))
-    if _has_jd_d:
-        fig_pd.add_trace(go.Bar(
-            x=prop_d["_jd_amt"], y=prop_d["Property"],
-            orientation="h", marker_color="#7C3AED", name="Unit 207 – Exceptional",
-            text=prop_d.apply(lambda r: f"${r['_amt']:,.0f} ★" if r["_jd_amt"] > 0 else "", axis=1),
-            textposition="outside",
-        ))
     fig_pd.update_layout(
-        barmode="stack",
         template="dfm",
         height=max(300, len(prop_d) * 36 + 80),
         xaxis=dict(title="Past Due ($)", tickprefix="$", gridcolor="#F1F5F9"),
         yaxis=dict(title=""),
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
         margin=dict(l=0, r=120, t=10, b=40),
-        showlegend=bool(_has_jd_d),
-        legend=dict(orientation="h", y=-0.14),
+        showlegend=False,
     )
     st.plotly_chart(fig_pd, width="stretch")
 
-    # ── Aging Heatmap by Property ─────────────────────────────────────────
-    _hm_cols = [c for c in ["0-30","31-60","61-90","91+"] if c in df_d.columns]
-    if len(_hm_cols) >= 2:
-        section("Aging Heatmap by Property")
-        _hm = df_d.groupby("Property")[_hm_cols].sum().reset_index()
-        _hm["_total"] = _hm[_hm_cols].sum(axis=1)
-        _hm = _hm[_hm["_total"] > 0].sort_values("_total", ascending=False).head(20)
-        if len(_hm):
-            _z = _hm[_hm_cols].values.tolist()
-            _text = [[f"${v:,.0f}" if v > 0 else "—" for v in row] for row in _z]
-            _col_labels = ["0–30d","31–60d","61–90d","91+d"][:len(_hm_cols)]
-            fig_hm = go.Figure(go.Heatmap(
-                z=_z,
-                x=_col_labels,
-                y=_hm["Property"].tolist(),
-                colorscale=[[0,"#F0FDF4"],[0.01,"#FEF9C3"],[0.3,"#FED7AA"],
-                            [0.6,"#FCA5A5"],[1.0,"#7F1D1D"]],
-                text=_text,
-                texttemplate="%{text}",
-                textfont=dict(size=11),
-                showscale=True,
-                colorbar=dict(title="$", tickprefix="$", len=0.8),
-                hovertemplate="<b>%{y}</b><br>%{x}: %{text}<extra></extra>",
-            ))
-            fig_hm.update_layout(
-                template="dfm",
-                height=max(320, len(_hm) * 30 + 80),
-                xaxis=dict(side="top"),
-                yaxis=dict(autorange="reversed"),
-                paper_bgcolor="#FFFFFF",
-                margin=dict(l=0, r=80, t=50, b=20),
-            )
-            st.plotly_chart(fig_hm, width="stretch")
+    section("Aging Heatmap by Property")
+    _hm_cols = ["0-30", "31-60", "61-90", "91+"]
+    _hm = df_d.groupby("Property")[_hm_cols].sum().reset_index()
+    _hm["_total"] = _hm[_hm_cols].sum(axis=1)
+    _hm = _hm[_hm["_total"] > 0].sort_values("_total", ascending=False).head(20)
 
-    # ── Top 20 Tenants ────────────────────────────────────────────────────
-    section(f"Top 20 Delinquent Tenants · {aging_label}")
-    sort_col = {"0–30 days": "d0", "0–60 days": "d_60", "0–90 days": "d_90", "91+ days": "d3", "All Periods": "total"}.get(aging_mode, "total")
-    ten_tbl = (
-        df_d.groupby(["Payer Name", "Property"])
-            .agg(total=("Amount Receivable", "sum"),
-                 d0=("0-30", "sum"), d1=("31-60", "sum"),
-                 d2=("61-90", "sum"), d3=("91+",   "sum"))
-            .reset_index()
-    )
-    ten_tbl["d_60"] = ten_tbl["d0"] + ten_tbl["d1"]
-    ten_tbl["d_90"] = ten_tbl["d0"] + ten_tbl["d1"] + ten_tbl["d2"]
-    ten_tbl = ten_tbl.sort_values(sort_col, ascending=False).head(20).copy()
-    ten_tbl = ten_tbl[["Payer Name", "Property", "total", "d0", "d1", "d2", "d3"]]
-    ten_tbl.columns = ["Tenant", "Property", "Total Past Due", "0–30", "31–60", "61–90", "91+"]
-    # Flag Jennifer Damian (Unit 207 – Zelzah) as exceptional case
-    ten_tbl["Tenant"] = ten_tbl["Tenant"].apply(
-        lambda n: f"⚠️ {n} (Unit 207)" if "jennifer damian" in str(n).lower() else n
-    )
-    for col in ["Total Past Due", "0–30", "31–60", "61–90", "91+"]:
-        ten_tbl[col] = ten_tbl[col].map(lambda x: f"${x:,.2f}")
-    c_dt, c_ddt = st.columns([4, 1])
-    with c_dt:  st.dataframe(ten_tbl, width="stretch", hide_index=True)
-    with c_ddt: download_btn(ten_tbl, "delinquent_tenants.csv")
+    if not _hm.empty:
+        _z = _hm[_hm_cols].values.tolist()
+        fig_hm = go.Figure(go.Heatmap(
+            z=_z,
+            x=["0–30d", "31–60d", "61–90d", "91+d"],
+            y=_hm["Property"].tolist(),
+            colorscale=[
+                [0, "#F0FDF4"], [0.01, "#FEF9C3"], [0.3, "#FED7AA"],
+                [0.6, "#FCA5A5"], [1, "#7F1D1D"],
+            ],
+            text=[
+                [f"${value:,.0f}" if value > 0 else "—" for value in row]
+                for row in _z
+            ],
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            colorbar=dict(title="$", tickprefix="$", len=0.8),
+            hovertemplate="<b>%{y}</b><br>%{x}: %{text}<extra></extra>",
+        ))
+        fig_hm.update_layout(
+            template="dfm",
+            height=max(320, len(_hm) * 30 + 80),
+            xaxis=dict(side="top"),
+            yaxis=dict(autorange="reversed"),
+            paper_bgcolor="#FFFFFF",
+            margin=dict(l=0, r=80, t=50, b=20),
+        )
+        st.plotly_chart(fig_hm, width="stretch")
 
+    # Top 20 delinquent residents. Keep the compact, scrollable table while
+    # using the full page width. The export button sits beside the title.
+    _title_col, _export_col = st.columns([5, 1], vertical_alignment="center")
+    with _title_col:
+        section(f"Top 20 Delinquent Residents · {aging_label}")
+
+    ten_tbl_raw = (
+        df_d.sort_values("_period_amt", ascending=False)
+        .head(20)
+        .copy()
+    )
+    ten_tbl_raw["Move In"] = ten_tbl_raw["Move In"].dt.strftime("%m/%d/%Y").fillna("")
+    ten_tbl_raw["Last Payment"] = ten_tbl_raw["Last Payment"].dt.strftime("%m/%d/%Y").fillna("")
+    ten_tbl_raw = ten_tbl_raw[[
+        "Name", "Property", "Unit", "Tenant Status", "_period_amt",
+        "Amount Receivable", "0-30", "31-60", "61-90", "91+",
+        "Last Payment", "Late Count",
+    ]].rename(columns={
+        "Name": "Resident",
+        "Tenant Status": "Resident Status",
+        "_period_amt": aging_label,
+        "Amount Receivable": "Total Past Due",
+    })
+
+    with _export_col:
+        st.download_button(
+            "⬇ Export CSV",
+            data=to_csv_bytes(ten_tbl_raw),
+            file_name="top_20_delinquent_residents.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    ten_tbl = ten_tbl_raw.copy()
+    _money_display_cols = [
+        aging_label, "Total Past Due", "0-30", "31-60", "61-90", "91+",
+    ]
+    for col in dict.fromkeys(_money_display_cols):
+        if col in ten_tbl.columns:
+            ten_tbl[col] = ten_tbl[col].map(lambda value: f"${value:,.2f}")
+
+    st.dataframe(
+        ten_tbl,
+        width="stretch",
+        height=500,
+        hide_index=True,
+    )
 
 # ============================================================================
 # PAGE 7 — OPERATIONS

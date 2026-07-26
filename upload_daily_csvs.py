@@ -825,6 +825,164 @@ def upload_tickler():
     print(f"Uploaded tenant_tickler: {len(records)} rows for {SNAPSHOT_DATE}")
 
 #=================================================
+#====Delinquency======================
+#=================================================
+
+def upload_delinquency():
+    fp = find_latest("delinquency")
+
+    if not fp:
+        print("No delinquency CSV found")
+        return
+
+    print(f"Found delinquency file: {fp}")
+
+    df = pd.read_csv(fp, dtype=str, low_memory=False)
+    df.columns = [c.strip() for c in df.columns]
+
+    required_columns = [
+        "Property",
+        "Unit",
+        "Unit ID",
+        "Name",
+        "Tenant Status",
+        "Amount Receivable",
+        "0-30",
+        "30+",
+        "60+",
+        "90+",
+    ]
+
+    missing_columns = [
+        col for col in required_columns
+        if col not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Missing delinquency columns: "
+            + ", ".join(missing_columns)
+        )
+
+    # Eliminar filas vacías o filas de totales sin propiedad
+    df = df[
+        df["Property"].notna()
+        & (df["Property"].astype(str).str.strip() != "")
+    ].copy()
+
+    df["snapshot_date"] = SNAPSHOT_DATE
+
+    rename = {
+        "Property": "property",
+        "Unit": "unit",
+        "Unit ID": "unit_id",
+        "Name": "name",
+        "Tenant Status": "tenant_status",
+        "Tags": "tags",
+        "Move In": "move_in",
+        "Amount Receivable": "amount_receivable",
+        "0-30": "d0_30",
+        "30+": "d30_plus",
+        "60+": "d60_plus",
+        "90+": "d90_plus",
+        "Last Payment": "last_payment",
+        "Late Count": "late_count",
+        "Delinquency Notes": "delinquency_notes",
+    }
+
+    df = df.rename(columns=rename)
+
+    keep_cols = [
+        "snapshot_date",
+        "property",
+        "unit",
+        "unit_id",
+        "name",
+        "tenant_status",
+        "tags",
+        "move_in",
+        "amount_receivable",
+        "d0_30",
+        "d30_plus",
+        "d60_plus",
+        "d90_plus",
+        "last_payment",
+        "late_count",
+        "delinquency_notes",
+    ]
+
+    # Crear columnas opcionales si no existen
+    for col in keep_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    df = df[keep_cols]
+
+    money_columns = [
+        "amount_receivable",
+        "d0_30",
+        "d30_plus",
+        "d60_plus",
+        "d90_plus",
+    ]
+
+    for col in money_columns:
+        df[col] = clean_money(df[col])
+
+    for col in ["move_in", "last_payment"]:
+        df[col] = pd.to_datetime(
+            df[col],
+            errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+
+    df["late_count"] = (
+        pd.to_numeric(df["late_count"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+    # Reemplazar textos vacíos
+    for col in [
+        "property",
+        "unit",
+        "unit_id",
+        "name",
+        "tenant_status",
+        "tags",
+        "delinquency_notes",
+    ]:
+        df[col] = (
+            df[col]
+            .replace({"": None, "nan": None, "None": None})
+        )
+
+    records = clean_for_json(df)
+
+    print(
+        f"Deleting delinquency snapshot {SNAPSHOT_DATE}"
+    )
+
+    supabase.table("delinquency") \
+        .delete() \
+        .eq("snapshot_date", SNAPSHOT_DATE) \
+        .execute()
+
+    print(
+        f"Uploading {len(records)} delinquency rows..."
+    )
+
+    for i in range(0, len(records), 500):
+        supabase.table("delinquency") \
+            .insert(records[i:i + 500]) \
+            .execute()
+
+    print(
+        f"Uploaded delinquency: {len(records)} rows "
+        f"for {SNAPSHOT_DATE}"
+    )
+
+
+#=================================================
 #====Building historical_metrics======================
 #=================================================
 
@@ -953,5 +1111,6 @@ if __name__ == "__main__":
     upload_renewal_summary()
     upload_rental_applications()
     upload_tickler()
+    upload_delinquency()
     upload_historical_metrics()
 

@@ -1251,6 +1251,16 @@ def _metrics():
     # Override Total Units con el conteo sin filtrar (VALID_STATUSES excluye algunas unidades)
     r_all = _rent_roll_all()
     if r_all is not None:
+        totals["Total Units"] = int(
+            len(
+                r_all[
+                    r_all["Status"].fillna("").str.strip() != ""
+                ]
+            )
+        )
+    
+    r_all = _rent_roll_all()
+    if r_all is not None:
         totals["Total Units"] = int(len(r_all))
     return m, totals, phys_occ, econ_occ
 

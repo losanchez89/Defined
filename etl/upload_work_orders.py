@@ -1,75 +1,128 @@
 import pandas as pd
-import streamlit as st
-from supabase import create_client
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+from supabase_client import supabase
+from etl.common import (
+    SNAPSHOT_DATE,
+    clean_for_json,
+    clean_money,
+    clean_text,
+    delete_snapshot,
+    find_latest,
+    upload_batches,
+)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-csv_file = r"data/raw/work_order.csv"
-from datetime import date
-snapshot_date = date.today().isoformat()
+def calculate_days_to_resolve(created_at, completed_on):
+    created = pd.to_datetime(created_at, errors="coerce")
+    completed = pd.to_datetime(completed_on, errors="coerce")
 
-df = pd.read_csv(csv_file)
-df.columns = [c.strip() for c in df.columns]
-
-def calc_days_to_resolve(created_at, completed_on):
-    start = pd.to_datetime(created_at, errors="coerce")
-    end = pd.to_datetime(completed_on, errors="coerce")
-
-    if pd.isna(start) or pd.isna(end):
+    if pd.isna(created) or pd.isna(completed):
         return None
 
-    return float((end - start).days)
+    return int((completed - created).days)
 
 
-def clean_text(value):
-    if pd.isna(value):
+def clean_date(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+
+    if pd.isna(parsed):
         return None
-    value = str(value).strip()
-    return value if value else None
+
+    return parsed.strftime("%Y-%m-%d")
 
 
-def clean_money(value):
-    if pd.isna(value):
-        return None
-    value = str(value).replace("$", "").replace(",", "").replace('"', "").strip()
-    if value == "" or value.lower() == "nan":
-        return None
-    number = pd.to_numeric(value, errors="coerce")
-    return None if pd.isna(number) else float(number)
+def upload_work_orders():
+    file_path = find_latest("work_order")
+
+    if not file_path:
+        print("No work_order file found in data/raw")
+        return
+
+    print(f"Found work_order file: {file_path}")
+
+    df = pd.read_csv(
+        file_path,
+        dtype=str,
+        low_memory=False,
+    )
+
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
+
+    required_columns = [
+        "Property",
+        "Status",
+        "Created At",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Missing required work-order columns: "
+            + ", ".join(missing_columns)
+        )
+
+    # Eliminamos filas completamente vacías o filas de resumen.
+    df = df[
+        df["Property"].notna()
+        & (df["Property"].astype(str).str.strip() != "")
+    ].copy()
+
+    records = []
+
+    for _, row in df.iterrows():
+        records.append({
+            "snapshot_date": SNAPSHOT_DATE,
+            "property": clean_text(row.get("Property")),
+            "unit": clean_text(row.get("Unit")),
+            "status": clean_text(row.get("Status")),
+            "priority": clean_text(row.get("Priority")),
+            "amount": clean_money(row.get("Amount")),
+            "created_at_raw": clean_text(row.get("Created At")),
+            "completed_on": clean_date(row.get("Completed On")),
+            "days_to_resolve": calculate_days_to_resolve(
+                row.get("Created At"),
+                row.get("Completed On"),
+            ),
+            "work_order_issue": clean_text(
+                row.get("Work Order Issue")
+            ),
+            "vendor": clean_text(row.get("Vendor")),
+            "work_order_type": clean_text(
+                row.get("Work Order Type")
+            ),
+        })
+
+    records = clean_for_json(pd.DataFrame(records))
+
+    print(
+        f"Replacing work_orders snapshot {SNAPSHOT_DATE} "
+        f"with {len(records)} rows..."
+    )
+
+    delete_snapshot(
+        table="work_orders",
+        supabase=supabase,
+    )
+
+    upload_batches(
+        table="work_orders",
+        records=records,
+        supabase=supabase,
+    )
+
+    print(
+        f"Uploaded work_orders: {len(records)} rows "
+        f"for {SNAPSHOT_DATE}"
+    )
 
 
-def clean_number(value):
-    if pd.isna(value):
-        return None
-    number = pd.to_numeric(value, errors="coerce")
-    return None if pd.isna(number) else float(number)
-
-
-records = []
-
-for _, row in df.iterrows():
-    records.append({
-        "snapshot_date": snapshot_date,
-        "property": clean_text(row.get("Property")),
-        "unit": clean_text(row.get("Unit")),
-        "status": clean_text(row.get("Status")),
-        "priority": clean_text(row.get("Priority")),
-        "amount": clean_money(row.get("Amount")),
-        "created_at": clean_text(row.get("Created At")),
-        "completed_on": clean_text(row.get("Completed On")),
-        "days_to_resolve": calc_days_to_resolve(
-            row.get("Created At"),
-            row.get("Completed On")
-        ),
-        "work_order_issue": clean_text(row.get("Work Order Issue")),
-        "vendor": clean_text(row.get("Vendor")),
-        "work_order_type": clean_text(row.get("Work Order Type")),
-    })
-
-supabase.table("work_orders").delete().eq("snapshot_date", snapshot_date).execute()
-supabase.table("work_orders").insert(records).execute()
-
-print(f"Uploaded {len(records)} work order rows")
+if __name__ == "__main__":
+    upload_work_orders()

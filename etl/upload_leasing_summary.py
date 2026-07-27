@@ -1,57 +1,118 @@
 import pandas as pd
-import streamlit as st
-from supabase import create_client
-from datetime import date
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-csv_file = r"data/raw/leasing_summary.csv"
-snapshot_date = date.today().isoformat()
-
-df = pd.read_csv(csv_file)
-df.columns = [c.strip() for c in df.columns]
+from supabase_client import supabase
+from etl.common import (
+    SNAPSHOT_DATE,
+    clean_int,
+    delete_snapshot,
+    find_latest,
+    upload_batches,
+)
 
 
-def clean_int(value):
-    if pd.isna(value):
-        return 0
-    value = str(value).replace(",", "").strip()
-    number = pd.to_numeric(value, errors="coerce")
-    return 0 if pd.isna(number) else int(number)
+def upload_leasing_summary():
+    file_path = find_latest("leasing_summary")
+
+    if not file_path:
+        print("No leasing_summary file found in data/raw")
+        return
+
+    print(f"Found leasing_summary file: {file_path}")
+
+    df = pd.read_csv(
+        file_path,
+        dtype=str,
+        low_memory=False,
+    )
+
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
+
+    required_columns = [
+        "Unit Type",
+        "Interests Received",
+        "Showings Completed",
+        "Applications Received",
+        "Move Ins",
+        "Move Outs",
+        "Leased",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Missing required leasing-summary columns: "
+            + ", ".join(missing_columns)
+        )
+
+    # Tomar únicamente la fila consolidada Total.
+    total_rows = df[
+        df["Unit Type"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("total")
+    ]
+
+    if total_rows.empty:
+        raise ValueError(
+            "Total row not found in leasing_summary.csv"
+        )
+
+    row = total_rows.iloc[0]
+
+    record = {
+        "snapshot_date": SNAPSHOT_DATE,
+        "leased": clean_int(row.get("Leased")),
+        "move_ins": clean_int(row.get("Move Ins")),
+        "move_outs": clean_int(row.get("Move Outs")),
+        "inquiries": clean_int(
+            row.get("Interests Received")
+        ),
+        "showings": clean_int(
+            row.get("Showings Completed")
+        ),
+        "applications": clean_int(
+            row.get("Applications Received")
+        ),
+    }
+
+    print("Leasing summary values:")
+    print(f"  Inquiries: {record['inquiries']}")
+    print(f"  Showings: {record['showings']}")
+    print(f"  Applications: {record['applications']}")
+    print(f"  Move Ins: {record['move_ins']}")
+    print(f"  Move Outs: {record['move_outs']}")
+    print(f"  Leased: {record['leased']}")
+
+    print(
+        f"Replacing leasing_summary snapshot "
+        f"{SNAPSHOT_DATE}..."
+    )
+
+    delete_snapshot(
+        table="leasing_summary",
+        supabase=supabase,
+    )
+
+    upload_batches(
+        table="leasing_summary",
+        records=[record],
+        supabase=supabase,
+    )
+
+    print(
+        f"Uploaded leasing_summary: 1 row "
+        f"for {SNAPSHOT_DATE}"
+    )
 
 
-# Tomamos la primera fila válida del summary
-total_row = df[df["Unit Type"] == "Total"]
-
-if len(total_row) == 0:
-    raise Exception("Total row not found")
-
-row = total_row.iloc[0]
-
-print("COLUMNAS:")
-print(df.columns.tolist())
-
-print("\nFILA TOTAL:")
-print(row)
-
-print("\nINTERESTS RECEIVED:")
-print(repr(row.get("Interests Received")))
-
-record = {
-    "snapshot_date": snapshot_date,
-    "leased": clean_int(row.get("Leased")),
-    "move_ins": clean_int(row.get("Move Ins")),
-    "move_outs": clean_int(row.get("Move Outs")),
-    "inquiries": clean_int(row.get("Interests Received")),
-    "showings": clean_int(row.get("Showings Completed")),
-    "applications": clean_int(row.get("Applications Received")),
-}
-
-supabase.table("leasing_summary").delete().eq("snapshot_date", snapshot_date).execute()
-supabase.table("leasing_summary").insert(record).execute()
-
-print("Uploaded leasing summary row")
-print(record)
+if __name__ == "__main__":
+    upload_leasing_summary()

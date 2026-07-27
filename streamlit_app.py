@@ -3392,7 +3392,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 # ============================================================================
 
 if st.session_state.page == "Overview":
-    page_header(COMPANY, f"Executive Dashboard  ·  {datetime.now().strftime('%B %d, %Y')}")
+    page_header(COMPANY, f"Portfolio Snapshot  ·  {datetime.now().strftime('%B %d, %Y')}")
 
     if df_metrics_f is None or totals is None:
         st.warning("No rent roll data found. Verify CSV files are in the configured folder.")
@@ -3426,41 +3426,67 @@ if st.session_state.page == "Overview":
             renewal_rate = len(actionable[actionable["Status"] == "Renewed"]) / len(actionable) * 100
 
    
-    # Historical deltas — only meaningful when no portfolio filter is active,
-    # because df_hist stores all-portfolio numbers and _phys_occ/_econ_occ would
-    # be portfolio-specific, making the delta apples-to-oranges.
-    delta_phys = delta_econ = None
-    _prev_date_label = "prior snapshot"
-
-    delta_phys = delta_econ = None
-    _prev_date_label = "prior snapshot"
+    # Previous-month comparison — portfolio-wide only, because historical_metrics
+    # stores all-portfolio values. We use the latest available snapshot from
+    # the previous calendar month.
+    delta_phys = delta_econ = delta_coll = None
+    _prev_date_label = "previous month"
 
     if df_hist is not None and len(df_hist) >= 2 and not SEL:
-        prev = df_hist.iloc[-2]
-
         try:
-            prev_phys = pd.to_numeric(prev.get("physical_occupancy", None), errors="coerce")
-            prev_econ = pd.to_numeric(prev.get("economic_occupancy", None), errors="coerce")
-            _prev_dt = pd.to_datetime(prev.get("date", None), errors="coerce")
+            _hist_cmp = df_hist.copy()
 
-            if pd.notna(prev_phys):
-                delta_phys = _phys_occ - float(prev_phys)
+            # df_hist is renamed earlier for display, so support both naming styles.
+            _date_col = "date" if "date" in _hist_cmp.columns else "Date"
+            _phys_col = (
+                "physical_occupancy"
+                if "physical_occupancy" in _hist_cmp.columns
+                else "Physical Occupancy"
+            )
+            _econ_col = (
+                "economic_occupancy"
+                if "economic_occupancy" in _hist_cmp.columns
+                else "Economic Occupancy"
+            )
+            _coll_col = (
+                "collection_rate"
+                if "collection_rate" in _hist_cmp.columns
+                else "Collection Rate"
+            )
 
-            if pd.notna(prev_econ):
-                delta_econ = _econ_occ - float(prev_econ)
+            _hist_cmp[_date_col] = pd.to_datetime(
+                _hist_cmp[_date_col], errors="coerce"
+            )
+            _hist_cmp = (
+                _hist_cmp.dropna(subset=[_date_col])
+                .sort_values(_date_col)
+            )
 
-            if pd.notna(_prev_dt):
-                days_ago = (pd.Timestamp.now().normalize() - _prev_dt.normalize()).days
+            _current_month = pd.Timestamp.now().to_period("M")
+            _previous_month = _current_month - 1
+            _prev_month_rows = _hist_cmp[
+                _hist_cmp[_date_col].dt.to_period("M") == _previous_month
+            ]
 
-                if days_ago == 1:
-                    _prev_date_label = "yesterday"
-                elif days_ago == 0:
-                    _prev_date_label = "earlier today"
-                else:
-                    _prev_date_label = f"{_prev_dt.month}/{_prev_dt.day}"
+            if not _prev_month_rows.empty:
+                prev = _prev_month_rows.iloc[-1]
+                prev_phys = pd.to_numeric(prev.get(_phys_col), errors="coerce")
+                prev_econ = pd.to_numeric(prev.get(_econ_col), errors="coerce")
+                prev_coll = pd.to_numeric(prev.get(_coll_col), errors="coerce")
+
+                if pd.notna(prev_phys):
+                    delta_phys = _phys_occ - float(prev_phys)
+
+                if pd.notna(prev_econ):
+                    delta_econ = _econ_occ - float(prev_econ)
+
+                if pd.notna(prev_coll):
+                    delta_coll = pct_collected - float(prev_coll)
+
+                _prev_date_label = prev[_date_col].strftime("%b %d")
 
         except Exception as e:
-            log.debug("historical delta calc: %s", e)
+            log.debug("previous-month delta calc: %s", e)
 
     # ── KPI Groups ────────────────────────────────────────────────────────
     def _grp(label, color):
@@ -3490,9 +3516,10 @@ if st.session_state.page == "Overview":
     c4, c5, c6 = st.columns(3)
     with c4: st.markdown(kpi("Monthly Rent (Current)", f"${sum_rent:,.0f}",
                               sub="Sum of rent — Current tenants only"), unsafe_allow_html=True)
-    with c5: st.markdown(kpi("% Collected", f"{pct_collected:.1f}%",
+    with c5: st.markdown(kpi("% Collected", f"{pct_collected:.1f}%", delta_coll, "%",
                               status=_tl(pct_collected, THR["collection_rate"]),
-                              sub=f"Target {THR['collection_rate']}% · Rent roll basis"), unsafe_allow_html=True)
+                              sub=f"Target {THR['collection_rate']}% · Rent roll basis",
+                              delta_label=_prev_date_label), unsafe_allow_html=True)
     with c6: st.markdown(kpi("Revenue Gap", f"${revenue_gap:,.0f}",
                               sub="Market rent at risk: Vacant-Unrented + Evict units"),
                          unsafe_allow_html=True)
@@ -3527,7 +3554,7 @@ if st.session_state.page == "Overview":
         else:
             st.info("No events in the next 14 days.")
 
-    # ── Historical trends ─────────────────────────────────────────────────
+
     # ── Historical trends ─────────────────────────────────────────────────
     section("Historical Trends")
 

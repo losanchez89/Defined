@@ -11,3 +11,8 @@ data/raw/
 data/temp/
 
 .DS_Store
+
+credentials.json
+token.json
+
+logs/

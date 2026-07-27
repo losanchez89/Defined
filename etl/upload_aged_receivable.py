@@ -1,70 +1,115 @@
 import pandas as pd
-import streamlit as st
-from supabase import create_client
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-csv_file = r"data/raw/aged_receivable_detail.csv"
-snapshot_date = "2026-06-11"
-
-df = pd.read_csv(csv_file)
-df.columns = [c.strip() for c in df.columns]
-
-
-def clean_text(value):
-    if pd.isna(value):
-        return None
-    value = str(value).strip()
-    return value if value else None
+from supabase_client import supabase
+from etl.common import (
+    SNAPSHOT_DATE,
+    clean_date,
+    clean_for_json,
+    clean_money,
+    clean_text,
+    delete_snapshot,
+    find_latest,
+    upload_batches,
+)
 
 
-def clean_money(value):
-    if pd.isna(value):
-        return None
-    value = str(value).replace("$", "").replace(",", "").replace('"', "").strip()
-    if value == "" or value.lower() == "nan":
-        return None
-    number = pd.to_numeric(value, errors="coerce")
-    if pd.isna(number):
-        return None
-    return float(number)
+def upload_aged_receivable():
+    file_path = find_latest("aged_receivable_detail")
 
-def clean_number(value):
-    if pd.isna(value):
-        return None
+    if not file_path:
+        print("No aged_receivable_detail file found in data/raw")
+        return
 
-    value = str(value).replace("$", "").replace(",", "").replace('"', "").strip()
+    print(f"Found aged receivable file: {file_path}")
 
-    if value == "" or value.lower() == "nan":
-        return None
+    df = pd.read_csv(
+        file_path,
+        dtype=str,
+        low_memory=False,
+    )
 
-    number = pd.to_numeric(value, errors="coerce")
-    return None if pd.isna(number) else float(number)
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
+
+    required_columns = [
+        "Property",
+        "Payer Name",
+        "Amount Receivable",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Missing required aged-receivable columns: "
+            + ", ".join(missing_columns)
+        )
+
+    df = df[
+        df["Property"].notna()
+        & (df["Property"].astype(str).str.strip() != "")
+    ].copy()
+
+    records = []
+
+    for _, row in df.iterrows():
+        records.append({
+            "snapshot_date": SNAPSHOT_DATE,
+            "property": clean_text(row.get("Property")),
+            "payer_name": clean_text(row.get("Payer Name")),
+            "amount_receivable": clean_money(
+                row.get("Amount Receivable")
+            ),
+            "d0_30": clean_money(row.get("0-30")),
+            "d31_60": clean_money(row.get("31-60")),
+            "d61_90": clean_money(row.get("61-90")),
+            "d91_plus": clean_money(row.get("91+")),
+            "gl_account_name": clean_text(
+                row.get("GL Account Name")
+            ),
+            "gl_account_number": clean_text(
+                row.get("GL Account Number")
+            ),
+            "total_amount": clean_money(
+                row.get("Total Amount")
+            ),
+            "charge_date": clean_date(
+                row.get("Charge Date")
+            ),
+            "posting_date": clean_date(
+                row.get("Posting Date")
+            ),
+        })
+
+    records = clean_for_json(pd.DataFrame(records))
+
+    print(
+        f"Replacing aged_receivable snapshot {SNAPSHOT_DATE} "
+        f"with {len(records)} rows..."
+    )
+
+    delete_snapshot(
+        table="aged_receivable",
+        supabase=supabase,
+    )
+
+    upload_batches(
+        table="aged_receivable",
+        records=records,
+        supabase=supabase,
+    )
+
+    print(
+        f"Uploaded aged_receivable: {len(records)} rows "
+        f"for {SNAPSHOT_DATE}"
+    )
 
 
-records = []
-
-for _, row in df.iterrows():
-    records.append({
-        "snapshot_date": snapshot_date,
-        "property": clean_text(row.get("Property")),
-        "payer_name": clean_text(row.get("Payer Name")),
-        "amount_receivable": clean_money(row.get("Amount Receivable")),
-        "d0_30": clean_money(row.get("0-30")),
-        "d31_60": clean_money(row.get("31-60")),
-        "d61_90": clean_money(row.get("61-90")),
-        "d91_plus": clean_money(row.get("91+")),
-        "gl_account_name": clean_text(row.get("GL Account Name")),
-        "gl_account_number": clean_text(row.get("GL Account Number")),
-        "total_amount": clean_number(row.get("Total Amount")),
-        "charge_date": clean_text(row.get("Charge Date")),
-        "posting_date": clean_text(row.get("Posting Date")),
-    })
-
-supabase.table("aged_receivable").delete().eq("snapshot_date", snapshot_date).execute()
-supabase.table("aged_receivable").insert(records).execute()
-
-print(f"Uploaded {len(records)} aged receivable rows")
+if __name__ == "__main__":
+    upload_aged_receivable()

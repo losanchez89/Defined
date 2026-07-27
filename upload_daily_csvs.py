@@ -6,6 +6,9 @@ from streamlit import status
 from supabase_client import supabase
 import os
 import glob
+from etl.upload_daily_calls_summary import upload_daily_calls_summary
+from etl.upload_daily_calls_users import upload_daily_calls_users
+
 
 DATA_DIR = Path("data/raw")
 SNAPSHOT_DATE = date.today().isoformat()
@@ -1100,17 +1103,48 @@ def upload_historical_metrics():
     )
 
 if __name__ == "__main__":
+
+    print("\n========== RENT ROLL ==========")
     upload_rent_roll()
+
+    print("\n========== WORK ORDERS ==========")
     upload_work_orders()
+
+    print("\n========== AGED RECEIVABLE ==========")
     upload_aged_receivable()
+
+    print("\n========== CALLS (OVERALL) ==========")
     upload_calls()
+
+    print("\n========== DAILY CALLS ==========")
+    upload_daily_calls_summary()
+    upload_daily_calls_users()
+
+    print("\n========== LEADS ==========")
     upload_leads()
+
+    print("\n========== LEASING FUNNEL ==========")
     upload_leasing_funnel()
+
+    print("\n========== LEASING SUMMARY ==========")
     upload_leasing_summary()
+
+    print("\n========== VACANCY DETAIL ==========")
     upload_vacancy_detail()
+
+    print("\n========== RENEWALS ==========")
     upload_renewal_summary()
+
+    print("\n========== RENTAL APPLICATIONS ==========")
     upload_rental_applications()
+
+    print("\n========== TENANT TICKLER ==========")
     upload_tickler()
+
+    print("\n========== DELINQUENCY ==========")
     upload_delinquency()
+
+    print("\n========== HISTORICAL METRICS ==========")
     upload_historical_metrics()
 
+    print("\n========== ETL COMPLETED ==========")

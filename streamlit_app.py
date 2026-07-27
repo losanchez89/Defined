@@ -1898,6 +1898,94 @@ def _calls_data():
         log.error("Users_Dashboard XLSX: %s", e)
         return None, None
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _daily_call_dates() -> list[str]:
+    """Returns available daily RingCentral report dates, newest first."""
+    try:
+        rows = (
+            supabase.table("daily_calls_summary")
+            .select("call_date")
+            .order("call_date", desc=True)
+            .execute()
+            .data
+        ) or []
+        return [str(row["call_date"]) for row in rows if row.get("call_date")]
+    except Exception as e:
+        log.warning("daily_calls_summary dates unavailable: %s", e)
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _daily_calls_data(call_date: str):
+    """Loads one daily summary row and its per-agent detail from Supabase."""
+    try:
+        summary_rows = (
+            supabase.table("daily_calls_summary")
+            .select("*")
+            .eq("call_date", call_date)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+
+        user_rows = (
+            supabase.table("daily_calls_users")
+            .select("*")
+            .eq("call_date", call_date)
+            .order("total_calls", desc=True)
+            .execute()
+            .data
+        ) or []
+
+        if not user_rows:
+            return None, (summary_rows[0] if summary_rows else {})
+
+        df = pd.DataFrame(user_rows).rename(columns={
+            "name": "Name",
+            "ext": "Ext",
+            "total_calls": "Total Calls",
+            "avg_daily": "Avg Daily",
+            "inbound": "Inbound",
+            "outbound": "Outbound",
+            "missed_vm": "Missed with VM",
+        })
+
+        for col in ["Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        for col in ["Total Calls", "Inbound", "Outbound", "Missed with VM"]:
+            df[col] = df[col].astype(int)
+
+        df["Missed VM %"] = (
+            df["Missed with VM"]
+            / df["Inbound"].replace(0, float("nan"))
+            * 100
+        ).fillna(0).round(1)
+
+        df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+        df = df[df["Name"] != ""].copy()
+
+        summary = summary_rows[0] if summary_rows else {}
+        return df.sort_values("Total Calls", ascending=False).reset_index(drop=True), summary
+    except Exception as e:
+        log.warning("daily calls load failed for %s: %s", call_date, e)
+        return None, {}
+
+
+def _format_duration(seconds) -> str:
+    """Formats seconds as H:MM:SS or M:SS."""
+    try:
+        total = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
 @st.cache_data(ttl=300)
 def _portfolio_history():
     try:
@@ -5651,58 +5739,152 @@ elif st.session_state.page == "Operations/Maintenance":
 # ============================================================================
 
 elif st.session_state.page == "Calls":
-    _period_label = ""
-    if calls_meta and calls_meta.get("start") and calls_meta.get("end"):
-        _s = calls_meta["start"].strftime("%b %d")
-        _e = calls_meta["end"].strftime("%b %d, %Y")
-        _period_label = f"{_s} – {_e}"
+    # ── Current Month / daily selector ───────────────────────────────────
+    daily_dates = _daily_call_dates()
+    view_options = ["Current Month"] + daily_dates
 
-    page_header("Calls", f"Team phone activity  ·  {_period_label}" if _period_label else "Team phone activity")
+    col_view, col_team, _ = st.columns([2, 2, 4])
+    with col_view:
+        selected_call_view = st.selectbox(
+            "Call View",
+            options=view_options,
+            index=0,
+            key="calls_view",
+        )
 
-    if df_calls is None or len(df_calls) == 0:
-        st.warning("No call data found. Place a Users_Dashboard*.xlsx file in the data folder.")
-        st.stop()
-
-    # ── Phone team filter (list driven by config.yaml > phone_team) ───────
     def _is_phone_team(name: str) -> bool:
         n = str(name).strip().lower()
         return any(pt.lower() in n for pt in PHONE_TEAM)
 
-    col_ft, _ = st.columns([2, 4])
-    with col_ft:
-        phone_only = st.toggle("Phone Team Only", value=True,
-                               help=" · ".join(PHONE_TEAM))
+    with col_team:
+        phone_only = st.toggle(
+            "Phone Team Only",
+            value=True,
+            help=" · ".join(PHONE_TEAM),
+            key="calls_phone_team_only",
+        )
 
-    # Active agents only (at least 1 call), then apply team filter
-    df_active = df_calls[df_calls["Total Calls"] > 0].copy()
+    is_daily_view = selected_call_view != "Current Month"
+    daily_summary = {}
+
+    if is_daily_view:
+        df_calls_view, daily_summary = _daily_calls_data(selected_call_view)
+        selected_dt = pd.to_datetime(selected_call_view, errors="coerce")
+        period_label = (
+            selected_dt.strftime("%b %d, %Y")
+            if not pd.isna(selected_dt)
+            else selected_call_view
+        )
+    else:
+        df_calls_view = df_calls
+        period_label = ""
+        if calls_meta and calls_meta.get("start") is not None and calls_meta.get("end") is not None:
+            start_dt = calls_meta["start"]
+            end_dt = calls_meta["end"]
+            if not pd.isna(start_dt) and not pd.isna(end_dt):
+                period_label = f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
+
+    page_header(
+        "Calls",
+        f"Team phone activity  ·  {period_label}" if period_label else "Team phone activity",
+    )
+
+    if df_calls_view is None or len(df_calls_view) == 0:
+        if is_daily_view:
+            st.warning(f"No agent call data found for {selected_call_view}.")
+        else:
+            st.warning("No overall call data found in the calls table.")
+        st.stop()
+
+    # Normalize required columns so both sources render identically.
+    df_calls_view = df_calls_view.copy()
+    required_numeric = ["Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]
+    for col in required_numeric:
+        if col not in df_calls_view.columns:
+            df_calls_view[col] = 0
+        df_calls_view[col] = pd.to_numeric(df_calls_view[col], errors="coerce").fillna(0)
+
+    if "Missed VM %" not in df_calls_view.columns:
+        df_calls_view["Missed VM %"] = (
+            df_calls_view["Missed with VM"]
+            / df_calls_view["Inbound"].replace(0, float("nan"))
+            * 100
+        ).fillna(0)
+    else:
+        df_calls_view["Missed VM %"] = pd.to_numeric(
+            df_calls_view["Missed VM %"], errors="coerce"
+        ).fillna(0)
+
+    # Active agents only, then optional configured team filter.
+    df_active = df_calls_view[df_calls_view["Total Calls"] > 0].copy()
     if phone_only:
         df_active = df_active[df_active["Name"].apply(_is_phone_team)].copy()
+    df_active = df_active.sort_values("Total Calls", ascending=False).reset_index(drop=True)
 
-    # ── Portfolio KPIs ────────────────────────────────────────────────────
-    total_calls   = int(df_active["Total Calls"].sum())
+    if df_active.empty:
+        st.info("No active agents match the selected filters.")
+        st.stop()
+
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    total_calls = int(df_active["Total Calls"].sum())
     total_inbound = int(df_active["Inbound"].sum())
-    total_outbound= int(df_active["Outbound"].sum())
-    total_missed  = int(df_active["Missed with VM"].sum())
-    missed_pct    = round(total_missed / total_inbound * 100, 1) if total_inbound > 0 else 0
-    n_agents      = len(df_active)
-    top_agent     = df_active.iloc[0]["Name"] if len(df_active) else "—"
-    top_agent_calls = int(df_active.iloc[0]["Total Calls"]) if len(df_active) else 0
+    total_outbound = int(df_active["Outbound"].sum())
+    total_missed = int(df_active["Missed with VM"].sum())
+    missed_pct = round(total_missed / total_inbound * 100, 1) if total_inbound > 0 else 0
+    n_agents = len(df_active)
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(kpi("Total Calls", f"{total_calls:,}",
-                              sub=f"{n_agents} active agents"), unsafe_allow_html=True)
-    with c2: st.markdown(kpi("Inbound", f"{total_inbound:,}",
-                              sub=f"{round(total_inbound/total_calls*100,1) if total_calls > 0 else 0}% of total"),
-                         unsafe_allow_html=True)
-    with c3: st.markdown(kpi("Outbound", f"{total_outbound:,}",
-                              sub=f"{round(total_outbound/total_calls*100,1) if total_calls > 0 else 0}% of total"),
-                         unsafe_allow_html=True)
-    with c4: st.markdown(kpi("Missed with VM", f"{total_missed:,}",
-                              sub=f"{missed_pct}% of inbound calls",
-                              status="warn" if missed_pct > 5 else "good"),
-                         unsafe_allow_html=True)
+    if is_daily_view:
+        c1, c2, c3, c4, c5 = st.columns(5)
+    else:
+        c1, c2, c3, c4 = st.columns(4)
 
-    # ── Charts row ────────────────────────────────────────────────────────
+    with c1:
+        st.markdown(
+            kpi("Total Calls", f"{total_calls:,}", sub=f"{n_agents} active agents"),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            kpi(
+                "Inbound",
+                f"{total_inbound:,}",
+                sub=f"{round(total_inbound / total_calls * 100, 1) if total_calls else 0}% of total",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            kpi(
+                "Outbound",
+                f"{total_outbound:,}",
+                sub=f"{round(total_outbound / total_calls * 100, 1) if total_calls else 0}% of total",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            kpi(
+                "Missed with VM",
+                f"{total_missed:,}",
+                sub=f"{missed_pct}% of inbound calls",
+                status="warn" if missed_pct > 5 else "good",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    if is_daily_view:
+        avg_handle_seconds = daily_summary.get("avg_duration_seconds", 0)
+        with c5:
+            st.markdown(
+                kpi(
+                    "Avg Handle Time",
+                    _format_duration(avg_handle_seconds),
+                    sub="daily report average",
+                ),
+                unsafe_allow_html=True,
+            )
+
+    # ── Charts ────────────────────────────────────────────────────────────
     col_l, col_r = st.columns(2)
 
     with col_l:
@@ -5712,7 +5894,7 @@ elif st.session_state.page == "Calls":
             x=df_active["Total Calls"],
             orientation="h",
             marker_color=PC,
-            text=df_active["Total Calls"].map(lambda x: f"{x:,}"),
+            text=df_active["Total Calls"].map(lambda x: f"{int(x):,}"),
             textposition="outside",
         ))
         fig_calls.update_layout(
@@ -5720,7 +5902,8 @@ elif st.session_state.page == "Calls":
             height=max(340, len(df_active) * 22 + 60),
             xaxis=dict(title="Total Calls", gridcolor="#F1F5F9"),
             yaxis=dict(title="", autorange="reversed"),
-            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
             margin=dict(l=0, r=60, t=10, b=30),
         )
         st.plotly_chart(fig_calls, width="stretch")
@@ -5730,13 +5913,17 @@ elif st.session_state.page == "Calls":
         df_top15 = df_active.head(15).sort_values("Inbound")
         fig_io = go.Figure()
         fig_io.add_trace(go.Bar(
-            y=df_top15["Name"], x=df_top15["Inbound"],
-            name="Inbound", orientation="h",
+            y=df_top15["Name"],
+            x=df_top15["Inbound"],
+            name="Inbound",
+            orientation="h",
             marker_color="#3B82F6",
         ))
         fig_io.add_trace(go.Bar(
-            y=df_top15["Name"], x=df_top15["Outbound"],
-            name="Outbound", orientation="h",
+            y=df_top15["Name"],
+            x=df_top15["Outbound"],
+            name="Outbound",
+            orientation="h",
             marker_color=PC,
         ))
         fig_io.update_layout(
@@ -5746,7 +5933,8 @@ elif st.session_state.page == "Calls":
             xaxis=dict(title="Calls", gridcolor="#F1F5F9"),
             yaxis=dict(title=""),
             legend=dict(orientation="h", y=-0.12),
-            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
             margin=dict(l=0, r=20, t=10, b=50),
         )
         st.plotly_chart(fig_io, width="stretch")
@@ -5755,58 +5943,84 @@ elif st.session_state.page == "Calls":
     section("Missed with VM Rate by Agent  (inbound calls only)")
 
     def _vm_color(p):
-        if p > 15: return "#7F1D1D"   # deep crimson — very high
-        if p > 10: return "#9F1239"   # rose-dark — high
-        if p > 5:  return "#B45309"   # warm amber — above threshold
-        return "#1E40AF"              # deep blue — within target
+        if p > 15:
+            return "#7F1D1D"
+        if p > 10:
+            return "#9F1239"
+        if p > 5:
+            return "#B45309"
+        return "#1E40AF"
 
     df_miss = df_active[df_active["Inbound"] > 0].copy()
-    df_miss = df_miss.sort_values("Missed VM %", ascending=False)  # worst at top
-    bar_colors_miss = [_vm_color(p) for p in df_miss["Missed VM %"]]
+    df_miss = df_miss.sort_values("Missed VM %", ascending=False)
 
-    st.markdown(
-        '<p style="font-size:11px;color:#6B7280;margin-bottom:6px;">'
-        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#1E40AF;margin-right:4px;vertical-align:middle;"></span>On target (≤5%) &nbsp;'
-        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#B45309;margin-right:4px;vertical-align:middle;"></span>Above threshold (5–10%) &nbsp;'
-        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#9F1239;margin-right:4px;vertical-align:middle;"></span>High (10–15%) &nbsp;'
-        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#7F1D1D;margin-right:4px;vertical-align:middle;"></span>Critical (&gt;15%)'
-        '</p>',
-        unsafe_allow_html=True,
-    )
-    fig_miss = go.Figure(go.Bar(
-        y=df_miss["Name"],
-        x=df_miss["Missed VM %"],
-        orientation="h",
-        marker=dict(color=bar_colors_miss, opacity=0.88),
-        text=df_miss["Missed VM %"].map(lambda x: f"{x:.1f}%"),
-        textposition="outside",
-        textfont=dict(size=11, color="#374151"),
-    ))
-    fig_miss.add_vline(x=5, line_dash="dot", line_color="#6B7280",
-                       annotation_text="5% target",
-                       annotation_position="top right",
-                       annotation_font=dict(size=10, color="#6B7280"))
-    fig_miss.update_layout(
-        template="dfm",
-        height=max(280, len(df_miss) * 26 + 60),
-        xaxis=dict(title="Missed with VM %", ticksuffix="%", gridcolor="#F1F5F9",
-                   tickfont=dict(size=11)),
-        yaxis=dict(title="", tickfont=dict(size=11), autorange="reversed"),
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-        margin=dict(l=0, r=80, t=10, b=30),
-    )
-    st.plotly_chart(fig_miss, width="stretch")
+    if df_miss.empty:
+        st.info("No inbound calls are available for the missed-call chart.")
+    else:
+        bar_colors_miss = [_vm_color(p) for p in df_miss["Missed VM %"]]
+        st.markdown(
+            '<p style="font-size:11px;color:#6B7280;margin-bottom:6px;">'
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#1E40AF;margin-right:4px;vertical-align:middle;"></span>On target (≤5%) &nbsp;'
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#B45309;margin-right:4px;vertical-align:middle;"></span>Above threshold (5–10%) &nbsp;'
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#9F1239;margin-right:4px;vertical-align:middle;"></span>High (10–15%) &nbsp;'
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#7F1D1D;margin-right:4px;vertical-align:middle;"></span>Critical (&gt;15%)'
+            '</p>',
+            unsafe_allow_html=True,
+        )
+        fig_miss = go.Figure(go.Bar(
+            y=df_miss["Name"],
+            x=df_miss["Missed VM %"],
+            orientation="h",
+            marker=dict(color=bar_colors_miss, opacity=0.88),
+            text=df_miss["Missed VM %"].map(lambda x: f"{x:.1f}%"),
+            textposition="outside",
+            textfont=dict(size=11, color="#374151"),
+        ))
+        fig_miss.add_vline(
+            x=5,
+            line_dash="dot",
+            line_color="#6B7280",
+            annotation_text="5% target",
+            annotation_position="top right",
+            annotation_font=dict(size=10, color="#6B7280"),
+        )
+        fig_miss.update_layout(
+            template="dfm",
+            height=max(280, len(df_miss) * 26 + 60),
+            xaxis=dict(
+                title="Missed with VM %",
+                ticksuffix="%",
+                gridcolor="#F1F5F9",
+                tickfont=dict(size=11),
+            ),
+            yaxis=dict(title="", tickfont=dict(size=11), autorange="reversed"),
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FFFFFF",
+            margin=dict(l=0, r=80, t=10, b=30),
+        )
+        st.plotly_chart(fig_miss, width="stretch")
 
-    # ── Full detail table ─────────────────────────────────────────────────
+    # ── Detail table ──────────────────────────────────────────────────────
     section("Agent Call Detail")
-    df_tbl = df_calls.copy()
-    df_tbl["Avg Daily"] = df_tbl["Avg Daily"].map(lambda x: f"{x:.0f}")
-    df_tbl["Missed VM %"] = df_tbl["Missed VM %"].map(lambda x: f"{x:.1f}%")
+    df_tbl = df_calls_view.copy()
+    df_tbl["Avg Daily"] = pd.to_numeric(df_tbl["Avg Daily"], errors="coerce").fillna(0).map(lambda x: f"{x:.0f}")
+    df_tbl["Missed VM %"] = pd.to_numeric(df_tbl["Missed VM %"], errors="coerce").fillna(0).map(lambda x: f"{x:.1f}%")
+
     c_ct, c_dct = st.columns([5, 1])
     with c_ct:
-        st.dataframe(df_tbl, width="stretch", hide_index=True, height=min(600, len(df_tbl) * 36 + 40))
+        st.dataframe(
+            df_tbl,
+            width="stretch",
+            hide_index=True,
+            height=min(600, len(df_tbl) * 36 + 40),
+        )
     with c_dct:
-        download_btn(df_calls, "calls_march_2026.csv")
+        export_name = (
+            f"calls_{selected_call_view}.csv"
+            if is_daily_view
+            else "calls_overall.csv"
+        )
+        download_btn(df_calls_view, export_name)
 
 
 # ============================================================================

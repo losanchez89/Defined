@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,15 @@ import plotly.io as pio
 import streamlit as st
 import yaml
 from supabase_client import supabase
+
+# ============================================================================
+# TIMEZONE
+# ============================================================================
+
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+
+def now():
+    return datetime.now(LOCAL_TZ)
 
 # ── Logging setup ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -298,7 +308,7 @@ def load_showings(directory):
     df['Property'] = df['Property'].apply(clean_property_name)
 
     # Filtrar a semana actual usando "Showing Time" (si existe)
-    today = pd.Timestamp.now().normalize()
+    today = pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).normalize()
     start_date = today - pd.Timedelta(days=6)
     if 'Showing Time' in df.columns:
         try:
@@ -2016,7 +2026,7 @@ def _portfolio_history():
 
 #def _save_snapshot(df_rr, totals, phys_occ, econ_occ) -> bool:
 #    p = DATA_DIR / "historical_metrics.csv"
-#    today = datetime.now().strftime("%Y-%m-%d")
+#    today = now().strftime("%Y-%m-%d")
 #    row = {
 #        "Date":               today,
 #        "Physical Occupancy": round(phys_occ, 2),
@@ -2050,7 +2060,7 @@ def _portfolio_history():
 #    # Keep only the last 180 days (6 months)
 #    try:
 #        h["_dt"] = pd.to_datetime(h["Date"], errors="coerce")
-#        cutoff = pd.Timestamp.now() - pd.Timedelta(days=180)
+#        cutoff = pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None) - pd.Timedelta(days=180)
 #        h = h[h["_dt"] >= cutoff].drop(columns=["_dt"])
 #    except Exception as e:
 #        log.warning("historical_metrics.csv date trim failed: %s", e)
@@ -2130,7 +2140,7 @@ with st.spinner("Loading portfolio data…"):
         )
 
         history_row = {
-            "snapshot_date": datetime.now().date().isoformat(),
+            "snapshot_date": now().date().isoformat(),
             "total_units": total_units_hist,
             "physical_occupancy": float(phys_occ or 0),
             "economic_occupancy": float(econ_occ or 0),
@@ -2301,7 +2311,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.session_state.snapshot_saved = False
         st.rerun()
-    st.caption(f"Last updated: {datetime.now().strftime('%b %d, %Y  %H:%M')}")
+    st.caption(f"Last updated: {now().strftime('%b %d, %Y  %H:%M')}")
 
     # ── Notes panel ─────────────────────────────────────────────────────
     st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:8px 0;">', unsafe_allow_html=True)
@@ -2336,7 +2346,7 @@ with st.sidebar:
                     "id":        len(st.session_state.notes),
                     "page":      st.session_state.page,
                     "content":   _new_note.strip(),
-                    "timestamp": datetime.now().strftime("%b %d, %Y %H:%M"),
+                    "timestamp": now().strftime("%b %d, %Y %H:%M"),
                 })
                 _save_notes(st.session_state.notes)
                 st.rerun()
@@ -2400,7 +2410,7 @@ df_renew_f   = _f(df_renew)
 df_apps_f    = _f(df_apps, col="Property")
 df_leads_f   = _f(df_leads_df)
 
-today_ts = pd.Timestamp.now().normalize()
+today_ts = pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).tz_localize(None).normalize()
 
 # Module-level lease expirations — shared across all pages
 exp30 = exp60 = exp90 = 0
@@ -2424,10 +2434,10 @@ else:
 # ============================================================================
 
 if st.session_state.page == "All Hands":
-    _ah_date = datetime.now().strftime("%B %d, %Y")
+    _ah_date = now().strftime("%B %d, %Y")
     _ah_col_hdr, _ah_col_btn = st.columns([5, 1])
     with _ah_col_hdr:
-        page_header("All Hands Meeting", f"Monthly Company Snapshot  ·  {_ah_date}")
+        page_header("All Hands Meeting", f"Monthly Company Snapshot  ·  {_ah_date} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     if df_metrics_f is None or totals is None:
         st.warning("Data not available.")
@@ -2459,12 +2469,12 @@ if st.session_state.page == "All Hands":
 
     _wo_open = _wo_total = _wo_completed = 0
     _wo_comp_pct = 0.0
-    _wo_month_label = datetime.now().strftime("%B %Y")
+    _wo_month_label = now().strftime("%B %Y")
     if df_wo_f is not None and "Status" in df_wo_f.columns:
         _df_wo_month = df_wo_f
         if "Created At" in df_wo_f.columns:
             _wo_created = pd.to_datetime(df_wo_f["Created At"], errors="coerce")
-            _now = datetime.now()
+            _now = now()
             _df_wo_month = df_wo_f[(_wo_created.dt.year == _now.year) & (_wo_created.dt.month == _now.month)]
         _wo_status = _df_wo_month["Status"].astype(str).str.lower()
         _wo_open      = int(_wo_status.isin(["open", "in progress", "new"]).sum())
@@ -2473,7 +2483,7 @@ if st.session_state.page == "All Hands":
         _wo_comp_pct  = (_wo_completed / _wo_total * 100) if _wo_total > 0 else 0.0
 
     # ── Monthly filters — All Hands only ─────────────────────────────────
-    _ah_now = datetime.now()
+    _ah_now = now()
     _ah_month, _ah_year = _ah_now.month, _ah_now.year
 
     # Query true monthly data across all snapshots (deduplicated)
@@ -2761,7 +2771,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         st.download_button(
             "Export Report",
             data=_build_report_html(),
-            file_name=f"all_hands_{datetime.now().strftime('%Y-%m-%d')}.html",
+            file_name=f"all_hands_{now().strftime('%Y-%m-%d')}.html",
             mime="text/html",
             type="secondary",
         )
@@ -3130,7 +3140,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         with _le_chart:
             # Per-property expiration breakdown for the next 30 days
             if df_rr_f is not None and "Lease To" in df_rr_f.columns and _exp_30d > 0:
-                _today_norm = pd.Timestamp.now().normalize()
+                _today_norm = pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).normalize()
                 _act_lt = df_rr_f[df_rr_f["Status"].isin(["Current", "Notice-Unrented", "Notice-Rented"])].copy()
                 _lt_ser = pd.to_datetime(_act_lt["Lease To"], errors="coerce")
                 _act_lt["_days"] = (_lt_ser - _today_norm).dt.days
@@ -3392,7 +3402,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 # ============================================================================
 
 if st.session_state.page == "Overview":
-    page_header(COMPANY, f"Portfolio Snapshot  ·  {datetime.now().strftime('%B %d, %Y')}")
+    page_header(COMPANY, f"Portfolio Snapshot  ·  {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     if df_metrics_f is None or totals is None:
         st.warning("No rent roll data found. Verify CSV files are in the configured folder.")
@@ -3462,7 +3472,7 @@ if st.session_state.page == "Overview":
                 .sort_values(_date_col)
             )
 
-            _current_month = pd.Timestamp.now().to_period("M")
+            _current_month = pd.Timestamp.now(tz=LOCAL_TZ).to_period("M")
             _previous_month = _current_month - 1
             _prev_month_rows = _hist_cmp[
                 _hist_cmp[_date_col].dt.to_period("M") == _previous_month
@@ -3807,7 +3817,7 @@ if st.session_state.page == "Overview":
 # ============================================================================
 
 elif st.session_state.page == "Vacancy":
-    page_header("Vacancy", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
+    page_header("Vacancy", f"Data as of {now().strftime('%B %d, %Y')}")
 
     if df_vac_f is None:
         st.warning("unit_vacancy_detail.csv not found.")
@@ -4232,7 +4242,7 @@ elif st.session_state.page == "Leasing":
 # ============================================================================
 
 elif st.session_state.page == "Renewals":
-    page_header("Renewals", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
+    page_header("Renewals", f"Data as of {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     # ── KPIs ──────────────────────────────────────────────────────────────
     rr_pct = avg_inc_pct = rev_retained = did_not_renew = 0
@@ -4302,7 +4312,7 @@ elif st.session_state.page == "Renewals":
     if df_rr_f is not None and "Lease To" in df_rr_f.columns:
         _df_cal = df_rr_f[df_rr_f["Status"] == "Current"].copy()
         _df_cal["Lease To"] = pd.to_datetime(_df_cal["Lease To"], errors="coerce")
-        _cal_start = pd.Timestamp(datetime.now().replace(day=1))
+        _cal_start = pd.Timestamp(now().replace(day=1))
         _cal_end   = _cal_start + pd.DateOffset(months=6)
         _df_cal = _df_cal[(_df_cal["Lease To"] >= _cal_start) & (_df_cal["Lease To"] < _cal_end)]
         if len(_df_cal):
@@ -4310,7 +4320,7 @@ elif st.session_state.page == "Renewals":
             _month_counts = (_df_cal.groupby("Month").size().reset_index(name="Leases Expiring")
                              .sort_values("Month"))
             _month_counts["Month Label"] = _month_counts["Month"].dt.strftime("%b %Y")
-            _now_period = pd.Period(datetime.now(), "M")
+            _now_period = pd.Period(now(), "M")
             _month_counts["_color"] = _month_counts["Month"].apply(
                 lambda m: "#DC2626" if m == _now_period
                 else "#D97706" if m == _now_period + 1
@@ -4377,7 +4387,7 @@ elif st.session_state.page == "Renewals":
 # ============================================================================
 
 elif st.session_state.page == "Collection":
-    page_header("Collection", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
+    page_header("Collection", f"Data as of {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     if df_rr_f is None:
         st.warning("Rent roll data not found.")
@@ -4582,7 +4592,7 @@ elif st.session_state.page == "Collection":
 # ============================================================================
 
 elif st.session_state.page == "Delinquency":
-    page_header("Delinquency", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
+    page_header("Delinquency", f"Data as of {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     if df_delinq_f is None:
         st.warning(
@@ -4951,7 +4961,7 @@ elif st.session_state.page == "Delinquency":
 # ============================================================================
 
 elif st.session_state.page == "Operations/Maintenance":
-    page_header("Operations / Maintenance", f"Data as of {datetime.now().strftime('%B %d, %Y')}")
+    page_header("Operations / Maintenance", f"Data as of {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
     if df_wo_f is None:
         st.warning("work_order.csv not found.")
@@ -4972,7 +4982,7 @@ elif st.session_state.page == "Operations/Maintenance":
         unique_months = sorted(wo_months.dropna().unique(), reverse=True)
         month_labels  = ["All Months"] + [m.strftime("%B %Y") for m in unique_months]
         month_periods = [None] + list(unique_months)
-        _cur_period   = pd.Period(datetime.now(), "M")
+        _cur_period   = pd.Period(now(), "M")
         _default_idx  = next((i for i, p in enumerate(month_periods) if p == _cur_period), 1)
         col_mf, _ = st.columns([2, 4])
         with col_mf:
@@ -5140,7 +5150,7 @@ elif st.session_state.page == "Operations/Maintenance":
         _open_mask = df_w["Status"].astype(str).str.lower().isin(["open", "in progress", "new"])
         _open_wo   = df_w[_open_mask].copy()
         if len(_open_wo):
-            _today_ts = pd.Timestamp(datetime.now().date())
+            _today_ts = pd.Timestamp(now().date())
             _open_wo["Days Open"] = (_today_ts - pd.to_datetime(_open_wo["Created At"], errors="coerce")).dt.days.fillna(0).astype(int)
             _aging_thr = int(THR.get("wo_resolution_days", 7))
             _overdue   = _open_wo[_open_wo["Days Open"] > _aging_thr].sort_values("Days Open", ascending=False)

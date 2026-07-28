@@ -22,6 +22,7 @@ import plotly.io as pio
 import streamlit as st
 import yaml
 from supabase_client import supabase
+from dashboard.overview import render as render_overview
 
 # ============================================================================
 # TIMEZONE
@@ -31,6 +32,38 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 def now():
     return datetime.now(LOCAL_TZ)
+
+
+from datetime import date
+
+GO_LIVE_DATE = date(2026, 8, 1)
+
+EXCLUDED_PROPERTIES = {
+    "Balboa Court Apartments",
+    "Chateau Vincennes",
+}
+
+def filter_future_properties(df):
+    """
+    Excluye propiedades que todavía no administramos.
+    Desde el 01/08/2026 dejarán de excluirse automáticamente.
+    """
+    if df is None:
+        return df
+
+    if now().date() >= GO_LIVE_DATE:
+        return df
+
+    if "Property" not in df.columns:
+        return df
+
+    return df[
+        ~df["Property"].astype(str).str.contains(
+            r"Balboa Court Apartments|Chateau Vincennes",
+            case=False,
+            na=False,
+        )
+    ].copy()
 
 # ── Logging setup ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -965,6 +998,11 @@ def download_btn(df: pd.DataFrame, filename: str, label: str = "⬇ Export CSV")
     st.download_button(label, data=to_csv_bytes(df),
                        file_name=filename, mime="text/csv")
 
+def render_overview_kpis(context):
+    """
+    Render Overview KPI cards.
+    """
+    pass
 
 # ============================================================================
 # DATA LOADERS
@@ -1038,6 +1076,8 @@ def _rent_roll():
         for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("rent_roll desde Supabase: %s", e)
@@ -1075,6 +1115,7 @@ def _rent_roll_all():
         for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("rent_roll_all desde Supabase: %s", e)
@@ -1103,6 +1144,7 @@ def _funnel():
             "approved":           "Approved",
             "signed_leases":      "Signed Leases",
         })
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("funnel desde Supabase: %s", e)
@@ -1247,6 +1289,7 @@ def _showings_agg():
             "calc_canceled":  "Calc_Canceled",
             "calc_scheduled": "Calc_Scheduled",
         })
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("showings_agg desde Supabase: %s", e)
@@ -1254,7 +1297,8 @@ def _showings_agg():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _metrics():
-    r, f = _rent_roll(), _funnel()
+    r = filter_future_properties(_rent_roll())
+    f = filter_future_properties(_funnel())
     if r is None: return None, None, None, None
     m = calculate_metrics(r, f)
     totals, econ_occ, phys_occ = calculate_totals_row(m)
@@ -1299,7 +1343,9 @@ def _vacancy_detail():
         for col in ["Last Rent", "Scheduled Rent"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df = filter_future_properties(df)
         return df
+        df = filter_future_properties(df)
     except Exception as e:
         log.error("vacancy_detail desde Supabase: %s", e)
         return None
@@ -1337,6 +1383,7 @@ def _aged_receivable():
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         if "Amount Receivable" in df.columns:
             df = df[df["Amount Receivable"] > 0].copy()
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("aged_receivable desde Supabase: %s", e)
@@ -1435,6 +1482,7 @@ def _delinquency():
         df["91+"] = df["90+"].clip(lower=0)
         df = df[df["Amount Receivable"] > 0].copy()
 
+        df = filter_future_properties(df)
         return df.reset_index(drop=True)
     except Exception as e:
         log.error("delinquency report load failed: %s", e)
@@ -1499,6 +1547,7 @@ def _work_orders():
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("work_orders desde Supabase: %s", e)
@@ -1528,6 +1577,7 @@ def _showings_raw():
         })
         if "Showing Time" in df.columns:
             df["Showing Time"] = pd.to_datetime(df["Showing Time"], errors="coerce")
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("showings_raw desde Supabase: %s", e)
@@ -1558,6 +1608,8 @@ def _tickler():
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         if "Rent" in df.columns:
             df["Rent"] = pd.to_numeric(df["Rent"], errors="coerce").fillna(0)
+
+        df = filter_future_properties(df)   
         return df.dropna(subset=["Date"])
     except Exception as e:
         log.error("tenant_tickler desde Supabase: %s", e)
@@ -1589,6 +1641,8 @@ def _renewals():
         for col in ["Previous Rent", "Rent", "Percent Difference"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("renewal_summary desde Supabase: %s", e)
@@ -1618,6 +1672,8 @@ def _applications():
         })
         if "Received" in df.columns:
             df["Received"] = pd.to_datetime(df["Received"], errors="coerce")
+
+        df = filter_future_properties(df)
         return df.dropna(subset=["Status"])
     except Exception as e:
         log.error("rental_applications desde Supabase: %s", e)
@@ -1650,6 +1706,7 @@ def _leads():
         for col in ["Monthly Income", "Max Rent", "Credit Score Mid", "Lead Score"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = filter_future_properties(df)
         return df
     except Exception as e:
         log.error("leads desde Supabase: %s", e)
@@ -3401,6 +3458,21 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 # PAGE 1 — OVERVIEW
 # ============================================================================
 
+context = {
+    "df_metrics_f": df_metrics_f,
+    "df_rr_f": df_rr_f,
+    "df_renew_f": df_renew_f,
+    "df_tickler_f": df_tickler_f,
+    "df_hist": df_hist,
+    "_totals": _totals,
+    "_phys_occ": _phys_occ,
+    "_econ_occ": _econ_occ,
+    "today_ts": today_ts,
+    "exp30": exp30,
+    "exp60": exp60,
+    "exp90": exp90,
+}
+
 if st.session_state.page == "Overview":
     page_header(COMPANY, f"Portfolio Snapshot  ·  {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
 
@@ -3497,6 +3569,8 @@ if st.session_state.page == "Overview":
 
         except Exception as e:
             log.debug("previous-month delta calc: %s", e)
+
+    render_overview_kpis(context)
 
     # ── KPI Groups ────────────────────────────────────────────────────────
     def _grp(label, color):

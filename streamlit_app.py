@@ -3459,26 +3459,47 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 # ============================================================================
 
 context = {
+    # Datos base del Overview
     "df_metrics_f": df_metrics_f,
     "df_rr_f": df_rr_f,
     "df_renew_f": df_renew_f,
     "df_tickler_f": df_tickler_f,
     "df_hist": df_hist,
+
+    # Totales y métricas
     "_totals": _totals,
     "_phys_occ": _phys_occ,
     "_econ_occ": _econ_occ,
+
+    # Fechas y vencimientos
     "today_ts": today_ts,
     "exp30": exp30,
     "exp60": exp60,
     "exp90": exp90,
+
+    # Funciones visuales
+    "page_header": page_header,
+    "section": section,
+    "kpi": kpi,
+    "_tl": _tl,
+
+    # Configuración
+    "THR": THR,
+    "PC": PC,
+    "COMPANY": COMPANY,
+
+    # Utilidades
+    "now": now,
+    "clean_money_column": clean_money_column,
 }
 
 if st.session_state.page == "Overview":
-    page_header(COMPANY, f"Portfolio Snapshot  ·  {now().strftime('%B %d, %Y')} · {now().strftime('%I:%M %p').lstrip('0')}")
-
     if df_metrics_f is None or totals is None:
         st.warning("No rent roll data found. Verify CSV files are in the configured folder.")
         st.stop()
+
+    # Encabezado, Executive Summary y Executive Score modularizados.
+    render_overview(context)
 
     total_units    = int(_totals.get("Total Units", 0))
     vacant_units   = int(_totals.get("Vacant-Unrented", 0))
@@ -3569,8 +3590,6 @@ if st.session_state.page == "Overview":
 
         except Exception as e:
             log.debug("previous-month delta calc: %s", e)
-
-    render_overview_kpis(context)
 
     # ── KPI Groups ────────────────────────────────────────────────────────
     def _grp(label, color):
@@ -4385,66 +4404,174 @@ elif st.session_state.page == "Renewals":
     # ── Lease Expiration Calendar (6 months) ──────────────────────────────
     if df_rr_f is not None and "Lease To" in df_rr_f.columns:
         _df_cal = df_rr_f[df_rr_f["Status"] == "Current"].copy()
-        _df_cal["Lease To"] = pd.to_datetime(_df_cal["Lease To"], errors="coerce")
-        _cal_start = pd.Timestamp(now().replace(day=1))
-        _cal_end   = _cal_start + pd.DateOffset(months=6)
-        _df_cal = _df_cal[(_df_cal["Lease To"] >= _cal_start) & (_df_cal["Lease To"] < _cal_end)]
+
+    # Convertir Lease To a fecha sin zona horaria
+        _df_cal["Lease To"] = pd.to_datetime(
+            _df_cal["Lease To"],
+            errors="coerce",
+        ).dt.tz_localize(None)
+
+    # Crear límites también sin zona horaria
+        _cal_start = pd.Timestamp(
+            now().replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+                tzinfo=None,
+            )
+        )
+
+        _cal_end = _cal_start + pd.DateOffset(months=6)
+
+        # Eliminar fechas inválidas antes de comparar
+        _df_cal = _df_cal.dropna(subset=["Lease To"])
+
+        _df_cal = _df_cal[
+            (_df_cal["Lease To"] >= _cal_start)
+            & (_df_cal["Lease To"] < _cal_end)
+        ]
+
         if len(_df_cal):
             _df_cal["Month"] = _df_cal["Lease To"].dt.to_period("M")
-            _month_counts = (_df_cal.groupby("Month").size().reset_index(name="Leases Expiring")
-                             .sort_values("Month"))
-            _month_counts["Month Label"] = _month_counts["Month"].dt.strftime("%b %Y")
-            _now_period = pd.Period(now(), "M")
+
+            _month_counts = (
+                _df_cal.groupby("Month")
+                .size()
+                .reset_index(name="Leases Expiring")
+                .sort_values("Month")
+            )
+
+            _month_counts["Month Label"] = (
+                _month_counts["Month"].dt.strftime("%b %Y")
+            )
+
+            _now_period = pd.Period(_cal_start, "M")
+
             _month_counts["_color"] = _month_counts["Month"].apply(
-                lambda m: "#DC2626" if m == _now_period
-                else "#D97706" if m == _now_period + 1
-                else "#F59E0B" if m == _now_period + 2
+                lambda m: "#DC2626"
+                if m == _now_period
+                else "#D97706"
+                if m == _now_period + 1
+                else "#F59E0B"
+                if m == _now_period + 2
                 else "#1B4FD8"
             )
+
             section("Lease Expiration Calendar — Next 6 Months")
-            fig_cal = go.Figure(go.Bar(
-                x=_month_counts["Month Label"],
-                y=_month_counts["Leases Expiring"],
-                marker_color=_month_counts["_color"],
-                text=_month_counts["Leases Expiring"],
-                textposition="outside",
-            ))
+
+            fig_cal = go.Figure(
+                go.Bar(
+                    x=_month_counts["Month Label"],
+                    y=_month_counts["Leases Expiring"],
+                    marker_color=_month_counts["_color"],
+                    text=_month_counts["Leases Expiring"],
+                    textposition="outside",
+                )
+            )
+
             fig_cal.update_layout(
-                template="dfm", height=260,
+                template="dfm",
+                height=260,
                 xaxis=dict(title=""),
-                yaxis=dict(title="Leases Expiring", gridcolor="#F1F5F9", rangemode="tozero"),
-                paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                yaxis=dict(
+                    title="Leases Expiring",
+                    gridcolor="#F1F5F9",
+                    rangemode="tozero",
+                ),
+                paper_bgcolor="#FFFFFF",
+                plot_bgcolor="#FFFFFF",
                 margin=dict(l=0, r=0, t=10, b=20),
             )
-            # Legend
+
             _leg_html = (
-                '<div style="display:flex;gap:18px;font-size:11px;color:#64748B;margin:4px 0 12px 4px;">'
-                '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#DC2626;margin-right:4px;"></span>This month</span>'
-                '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#D97706;margin-right:4px;"></span>Next month</span>'
-                '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#F59E0B;margin-right:4px;"></span>+2 months</span>'
-                '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#1B4FD8;margin-right:4px;"></span>Later</span>'
+                '<div style="display:flex;gap:18px;font-size:11px;'
+                'color:#64748B;margin:4px 0 12px 4px;">'
+                '<span><span style="display:inline-block;width:10px;'
+                'height:10px;border-radius:2px;background:#DC2626;'
+                'margin-right:4px;"></span>This month</span>'
+                '<span><span style="display:inline-block;width:10px;'
+                'height:10px;border-radius:2px;background:#D97706;'
+                'margin-right:4px;"></span>Next month</span>'
+                '<span><span style="display:inline-block;width:10px;'
+                'height:10px;border-radius:2px;background:#F59E0B;'
+                'margin-right:4px;"></span>+2 months</span>'
+                '<span><span style="display:inline-block;width:10px;'
+                'height:10px;border-radius:2px;background:#1B4FD8;'
+                'margin-right:4px;"></span>Later</span>'
                 '</div>'
             )
+
             st.markdown(_leg_html, unsafe_allow_html=True)
             st.plotly_chart(fig_cal, width="stretch")
 
     # ── Upcoming expirations ──────────────────────────────────────────────
     section("Leases Expiring in the Next 90 Days")
+
     if df_rr_f is not None and "Lease To" in df_rr_f.columns:
-        df_exp = df_rr_f[df_rr_f["Status"]=="Current"].copy()
-        df_exp["Lease To"] = pd.to_datetime(df_exp["Lease To"], errors="coerce")
+        df_exp = df_rr_f[df_rr_f["Status"] == "Current"].copy()
+        df_exp["Lease To"] = pd.to_datetime(
+            df_exp["Lease To"],
+            errors="coerce",
+        ).dt.tz_localize(None)
+
+        _today_exp = pd.Timestamp(
+            now().replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+                tzinfo=None,
+            )
+        )
+
+        _exp_end = _today_exp + pd.Timedelta(days=90)
+
+        df_exp = df_exp.dropna(subset=["Lease To"])
+
         df_exp = df_exp[
-            (df_exp["Lease To"] >= today_ts) &
-            (df_exp["Lease To"] <= today_ts + pd.Timedelta(90,"d"))
+            (df_exp["Lease To"] >= _today_exp)
+            & (df_exp["Lease To"] <= _exp_end)
         ].sort_values("Lease To")
+
         if len(df_exp):
-            df_exp["Days Until Exp"] = (df_exp["Lease To"] - today_ts).dt.days
-            want_e = [c for c in ["Property","Unit","Tenant","Rent","Lease To","Days Until Exp"] if c in df_exp.columns]
-            c_e, c_de = st.columns([4,1])
-            with c_e:  st.dataframe(df_exp[want_e], width="stretch", hide_index=True, height=350)
-            with c_de: download_btn(df_exp[want_e], "expiring_leases.csv")
+            df_exp["Days Until Exp"] = (
+                df_exp["Lease To"] - _today_exp
+            ).dt.days
+
+            want_e = [
+                c
+                for c in [
+                    "Property",
+                    "Unit",
+                    "Tenant",
+                    "Rent",
+                    "Lease To",
+                    "Days Until Exp",
+                ]
+                if c in df_exp.columns
+            ]
+
+            c_e, c_de = st.columns([4, 1])
+
+            with c_e:
+                st.dataframe(
+                    df_exp[want_e],
+                    width="stretch",
+                    hide_index=True,
+                    height=350,
+                )
+
+            with c_de:
+                download_btn(
+                    df_exp[want_e],
+                    "expiring_leases.csv",
+                )
         else:
-            st.success("No leases expiring in the next 90 days.")
+            st.success(
+                "No leases expiring in the next 90 days."
+            )
 
     # ── Renewals detail ───────────────────────────────────────────────────
     if df_renew_f is not None and len(df_renew_f):

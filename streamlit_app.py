@@ -524,9 +524,20 @@ def calculate_metrics(df_rent_roll, df_funnel=None):
         else:
             df_metrics[col] = pd.to_numeric(df_metrics[col], errors="coerce").fillna(0)
 
-    df_metrics["Lease Conversion %"] = (
-        df_metrics["Signed Leases"] / df_metrics["Inquiries"].replace(0, pd.NA) * 100
-    ).fillna(0).replace([float("inf"), float("-inf")], 0)
+    lease_conversion = (
+        df_metrics["Signed Leases"]
+        / df_metrics["Inquiries"].replace(0, pd.NA)
+        * 100
+    )
+
+    lease_conversion = (
+        pd.to_numeric(lease_conversion, errors="coerce")
+        .replace([float("inf"), float("-inf")], pd.NA)
+        .fillna(0.0)
+    )
+
+    df_metrics["Lease Conversion %"] = lease_conversion
+
 
     df_metrics = df_metrics.sort_values("Property").reset_index(drop=True)
     print(f"   ✓ Métricas calculadas para {len(df_metrics)} propiedades")
@@ -3565,7 +3576,8 @@ if st.session_state.page == "Overview":
                 .sort_values(_date_col)
             )
 
-            _current_month = pd.Timestamp.now(tz=LOCAL_TZ).to_period("M")
+            _current_month = (pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).to_period("M"))
+            
             _previous_month = _current_month - 1
             _prev_month_rows = _hist_cmp[
                 _hist_cmp[_date_col].dt.to_period("M") == _previous_month
@@ -3805,7 +3817,7 @@ if st.session_state.page == "Overview":
             margin=dict(l=0, r=80, t=10, b=50),
         )
 
-        st.plotly_chart(fig_ht, use_container_width=True)
+        st.plotly_chart(fig_ht, width="stretch")
 
         
 
@@ -5603,7 +5615,7 @@ elif st.session_state.page == "Operations/Maintenance":
                 )
                 _fig_dur.update_layout(showlegend=False,
                                         margin=dict(t=40, b=10, l=0, r=0), height=300)
-                st.plotly_chart(_fig_dur, use_container_width=True)
+                st.plotly_chart(_fig_dur, width="stretch")
             else:
                 st.caption("No duration data available.")
 
@@ -5631,7 +5643,7 @@ elif st.session_state.page == "Operations/Maintenance":
                     template="dfm", title="Duration vs Cost per Turn",
                 )
                 _fig_scatter.update_layout(margin=dict(t=40, b=10, l=0, r=0), height=300)
-                st.plotly_chart(_fig_scatter, use_container_width=True)
+                st.plotly_chart(_fig_scatter, width="stretch")
             else:
                 st.caption("Not enough data for scatter.")
 
@@ -5660,7 +5672,7 @@ elif st.session_state.page == "Operations/Maintenance":
                 )
                 _fig_appr.update_layout(showlegend=False,
                                          margin=dict(t=40, b=10, l=0, r=0), height=300)
-                st.plotly_chart(_fig_appr, use_container_width=True)
+                st.plotly_chart(_fig_appr, width="stretch")
             else:
                 st.info("Approval wait data not available — AppFolio estimate fields may not be populated for these turns.")
 
@@ -5677,7 +5689,7 @@ elif st.session_state.page == "Operations/Maintenance":
                     template="dfm", color_discrete_sequence=["#3B82F6"],
                 )
                 _fig_funnel.update_layout(margin=dict(t=10, b=10, l=0, r=0), height=260)
-                st.plotly_chart(_fig_funnel, use_container_width=True)
+                st.plotly_chart(_fig_funnel, width="stretch")
                 if len(_appr_data):
                     _avg_wait = float(_appr_data.mean())
                     _max_wait = float(_appr_data.max())
@@ -5721,7 +5733,7 @@ elif st.session_state.page == "Operations/Maintenance":
                 )
                 _fig_cpd.update_layout(coloraxis_showscale=False,
                                         margin=dict(t=40, b=10, l=0, r=10), height=380)
-                st.plotly_chart(_fig_cpd, use_container_width=True)
+                st.plotly_chart(_fig_cpd, width="stretch")
             else:
                 st.caption("No $/day data available.")
 
@@ -5735,7 +5747,7 @@ elif st.session_state.page == "Operations/Maintenance":
             _top5.columns = ["Property", "Unit", "Days", "Total $", "$/Day"]
             _top5["Total $"] = _top5["Total $"].map(lambda x: f"${x:,.0f}")
             _top5["$/Day"]   = _top5["$/Day"].map(lambda x: f"${x:,.0f}")
-            st.dataframe(_top5, hide_index=True, use_container_width=True)
+            st.dataframe(_top5, hide_index=True, width="stretch")
 
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown("**Fastest Completed Turns**")
@@ -5745,7 +5757,7 @@ elif st.session_state.page == "Operations/Maintenance":
                       .copy())
             _fast5.columns = ["Property", "Unit", "Days", "Total $"]
             _fast5["Total $"] = _fast5["Total $"].map(lambda x: f"${x:,.0f}")
-            st.dataframe(_fast5, hide_index=True, use_container_width=True)
+            st.dataframe(_fast5, hide_index=True, width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -5773,7 +5785,7 @@ elif st.session_state.page == "Operations/Maintenance":
             _fig_donut.update_layout(margin=dict(t=40, b=10, l=0, r=0),
                                       height=300, showlegend=True,
                                       legend=dict(orientation="h", y=-0.05))
-            st.plotly_chart(_fig_donut, use_container_width=True)
+            st.plotly_chart(_fig_donut, width="stretch")
             _tot = _int_total + _ext_total
             _ki1, _ki2 = st.columns(2)
             with _ki1: st.markdown(kpi("Internal", f"${_int_total:,.0f}",
@@ -5809,7 +5821,7 @@ elif st.session_state.page == "Operations/Maintenance":
                     name="Internal (DPM)" if t.name == "int_spend" else "External"))
                 _fig_stack.update_layout(margin=dict(t=40, b=10, l=0, r=0),
                                           height=380, legend_title_text="")
-                st.plotly_chart(_fig_stack, use_container_width=True)
+                st.plotly_chart(_fig_stack, width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -5837,7 +5849,7 @@ elif st.session_state.page == "Operations/Maintenance":
             _fig_comp.update_layout(margin=dict(t=40, b=30, l=0, r=0),
                                      height=300, showlegend=True,
                                      legend=dict(orientation="h", y=-0.1))
-            st.plotly_chart(_fig_comp, use_container_width=True)
+            st.plotly_chart(_fig_comp, width="stretch")
             _n_comp_t = int((_agg["_turn_status"] == "Completed").sum())
             _comp_rate = _n_comp_t / _total_turns * 100 if _total_turns else 0
             st.markdown(
@@ -5867,7 +5879,7 @@ elif st.session_state.page == "Operations/Maintenance":
                 _fig_eas.update_layout(margin=dict(t=40, b=30, l=0, r=0),
                                         height=300, showlegend=True,
                                         legend=dict(orientation="h", y=-0.1))
-                st.plotly_chart(_fig_eas, use_container_width=True)
+                st.plotly_chart(_fig_eas, width="stretch")
                 _n_appr  = int((_wo_appr_status.str.lower() == "approved").sum())
                 _appr_rt = _n_appr / len(_wo_appr_status) * 100
                 st.markdown(

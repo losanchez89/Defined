@@ -1510,11 +1510,14 @@ def _work_orders():
         _batch   = 1000
         _offset  = 0
         while True:
-            res = supabase.table("work_orders")\
-                .select("*")\
-                .eq("snapshot_date", snap)\
-                .range(_offset, _offset + _batch - 1)\
+            res = (
+                supabase.table("work_orders")
+                .select("*")
+                .eq("snapshot_date", snap)
+                .order("id", desc=False)
+                .range(_offset, _offset + _batch - 1)
                 .execute()
+            )
             if not res.data:
                 break
             all_rows.extend(res.data)
@@ -1524,6 +1527,7 @@ def _work_orders():
         if not all_rows:
             return None
         df = pd.DataFrame(all_rows)
+        df = df.drop_duplicates(subset=["id"]).copy()
         df = df.rename(columns={
             "property":                              "Property",
             "unit":                                  "Unit",

@@ -1362,19 +1362,34 @@ def _vacancy_detail():
         return None
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _aged_receivable():
+def _aged_receivable(include_paid: bool = False):
+    """
+    Carga todas las filas del snapshot más reciente de aged_receivable.
+
+    include_paid=False:
+        Devuelve solamente registros con saldo pendiente.
+
+    include_paid=True:
+        Incluye cargos pagados y pendientes. Se usa para Section 8 Billed.
+    """
     try:
         snap = _latest_snapshot("aged_receivable")
         if not snap:
             return None
-        res = supabase.table("aged_receivable")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+
+        # Descargar todas las filas mediante paginación para superar
+        # el límite de 1,000 registros por solicitud de Supabase/PostgREST.
+        data = _fetch_all(
+            table="aged_receivable",
+            snap=snap,
+            page_size=1000,
+        )
+
+        if not data:
             return None
-        df = pd.DataFrame(res.data)
+
+        df = pd.DataFrame(data)
+
         df = df.rename(columns={
             "property":          "Property",
             "payer_name":        "Payer Name",
@@ -1389,13 +1404,30 @@ def _aged_receivable():
             "charge_date":       "Charge Date",
             "posting_date":      "Posting Date",
         })
-        for col in ["Amount Receivable", "Total Amount", "0-30", "31-60", "61-90", "91+"]:
+
+        for col in [
+            "Amount Receivable",
+            "Total Amount",
+            "0-30",
+            "31-60",
+            "61-90",
+            "91+",
+        ]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        if "Amount Receivable" in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        for col in ["Charge Date", "Posting Date"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Las demás secciones usan únicamente balances pendientes.
+        # Section 8 usa include_paid=True para incluir cargos pagados y pendientes.
+        if not include_paid and "Amount Receivable" in df.columns:
             df = df[df["Amount Receivable"] > 0].copy()
+
         df = filter_future_properties(df)
-        return df
+        return df.reset_index(drop=True)
+
     except Exception as e:
         log.error("aged_receivable desde Supabase: %s", e)
         return None
@@ -2150,6 +2182,7 @@ with st.spinner("Loading portfolio data…"):
     df_metrics, totals, phys_occ, econ_occ = _metrics()
     df_hist     = _historical()
     df_aged     = _aged_receivable()
+    df_aged_all = _aged_receivable(include_paid=True)
     df_delinq    = _delinquency()
     df_vac      = _vacancy_detail()
     df_wo       = _work_orders()
@@ -4634,32 +4667,69 @@ elif st.session_state.page == "Collection":
         else 0.0
     )
 
-    section8_billed = 0
-    section8_receivable = 0
-    section8_collected = 0
+    # ------------------------------------------------------------------
+    # Section 8 Performance — current month only
+    # Source: Aged Receivable Detail, filtered by GL Account Name and
+    # Charge Date for the current calendar month in the dashboard timezone.
+    # ------------------------------------------------------------------
+    section8_billed = 0.0
+    section8_receivable = 0.0
+    section8_collected = 0.0
+    section8_collection_rate = 0.0
 
     _s8 = pd.DataFrame()
+    _current_month = pd.Timestamp(now().date()).to_period("M")
+    _section8_period_label = _current_month.strftime("%B %Y")
 
-    if df_aged_f is not None and "GL Account Name" in df_aged_f.columns:
-        _s8 = df_aged_f[
-            df_aged_f["GL Account Name"]
+    if (
+        df_aged_all is not None
+        and not df_aged_all.empty
+        and "GL Account Name" in df_aged_all.columns
+        and "Charge Date" in df_aged_all.columns
+    ):
+        # Use the full portfolio aged-receivable report.
+        # Section 8 KPIs should not be reduced by sidebar property/portfolio filters.
+        
+       
+        _s8 = df_aged_all.copy()
+
+        # Keep only Section 8 charge-detail rows.
+        _s8 = _s8[
+            _s8["GL Account Name"]
+            .fillna("")
             .astype(str)
-            .str.contains("section 8", case=False, na=False)
+            .str.contains(r"\bsection\s*8\b", case=False, na=False, regex=True)
         ].copy()
 
-    if "Total Amount" in _s8.columns:
-        section8_billed = _s8["Total Amount"].sum()
+        # Keep only charges belonging to the current month.
+        _s8["Charge Date"] = pd.to_datetime(
+            _s8["Charge Date"],
+            errors="coerce",
+        )
+        _s8 = _s8[
+            _s8["Charge Date"].dt.to_period("M") == _current_month
+        ].copy()
 
-    if "Amount Receivable" in _s8.columns:
-        section8_receivable = _s8["Amount Receivable"].sum()
+        # Ensure money fields are numeric before calculating the KPIs.
+        for _money_col in ["Total Amount", "Amount Receivable"]:
+            if _money_col in _s8.columns:
+                _s8[_money_col] = pd.to_numeric(
+                    _s8[_money_col],
+                    errors="coerce",
+                ).fillna(0.0)
 
-    section8_collected = section8_billed - section8_receivable
+        if "Total Amount" in _s8.columns:
+            section8_billed = float(_s8["Total Amount"].sum())
 
-    section8_collection_rate = (
-        section8_collected / section8_billed
-        if section8_billed > 0
-        else 0
-    )
+        if "Amount Receivable" in _s8.columns:
+            section8_receivable = float(_s8["Amount Receivable"].sum())
+
+        section8_collected = section8_billed - section8_receivable
+        section8_collection_rate = (
+            section8_collected / section8_billed
+            if section8_billed > 0
+            else 0.0
+        )
 
     c1,c2,c3 = st.columns(3)
     with c1: st.markdown(kpi("Total Billed", f"${billed:,.0f}",
@@ -4698,7 +4768,7 @@ elif st.session_state.page == "Collection":
             kpi(
                 "Section 8 Billed",
                 f"${section8_billed:,.0f}",
-                sub="Total Section 8 charges"
+                sub=f"Charges dated {_section8_period_label}"
             ),
             unsafe_allow_html=True
         )
@@ -4709,7 +4779,7 @@ elif st.session_state.page == "Collection":
                 "Section 8 Collected",
                 f"${section8_collected:,.0f}",
                 status="good" if section8_collected >= 0 else "bad",
-                sub="Billed minus receivable"
+                sub=f"Billed minus receivable · {_section8_period_label}"
             ),
             unsafe_allow_html=True
         )
@@ -4720,7 +4790,7 @@ elif st.session_state.page == "Collection":
                 "Section 8 Receivable",
                 f"${section8_receivable:,.0f}",
                 status="warn" if section8_receivable > 0 else "good",
-                sub="Outstanding Section 8 balance"
+                sub=f"Outstanding balance · {_section8_period_label}"
             ),
             unsafe_allow_html=True
         )
@@ -4731,7 +4801,7 @@ elif st.session_state.page == "Collection":
                 "Collection Rate",
                 f"{section8_collection_rate:.1%}",
                 status="good" if section8_collection_rate >= 0.95 else "warn",
-                sub="Section 8 collected vs billed"
+                sub=f"Collected vs billed · {_section8_period_label}"
             ),
             unsafe_allow_html=True
         )
@@ -4817,7 +4887,6 @@ elif st.session_state.page == "Collection":
     c_ct, c_dct = st.columns([4,1])
     with c_ct:  st.dataframe(prop_c_disp[disp_c], width="stretch", hide_index=True)
     with c_dct: download_btn(prop_c_disp[disp_c], "collection_by_property.csv")
-
 
 # ============================================================================
 # PAGE 6 — DELINQUENCY

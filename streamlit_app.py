@@ -4614,10 +4614,25 @@ elif st.session_state.page == "Collection":
     if "Rent"     in df_c.columns: df_c["Rent"]     = df_c["Rent"].astype(float)
     if "Past Due" in df_c.columns: df_c["Past Due"] = clean_money_column(df_c["Past Due"])
 
-    billed    = df_c["Rent"].sum()     if "Rent"     in df_c.columns else 0
-    past_due  = df_c["Past Due"].sum() if "Past Due" in df_c.columns else 0
-    collected = billed - past_due
-    pct_c     = max(0.0, min(100.0, (collected / billed * 100) if billed > 0 else 0.0))
+    billed = df_c["Rent"].sum() if "Rent" in df_c.columns else 0
+
+    # Solo saldos realmente pendientes.
+    # Los créditos negativos no reducen el outstanding balance.
+    past_due = (
+        df_c["Past Due"]
+        .clip(lower=0)
+        .sum()
+        if "Past Due" in df_c.columns
+        else 0
+    )
+
+    collected = max(0.0, billed - past_due)
+
+    pct_c = (
+        max(0.0, min(100.0, collected / billed * 100))
+        if billed > 0
+        else 0.0
+    )
 
     section8_billed = 0
     section8_receivable = 0

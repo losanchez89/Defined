@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -8,6 +9,9 @@ LOG_DIR = BASE_DIR / "logs"
 
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 TOKEN_FILE = BASE_DIR / "token.json"
+
+GMAIL_CREDENTIALS_JSON = os.getenv("GMAIL_CREDENTIALS_JSON", "").strip()
+GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON", "").strip()
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 

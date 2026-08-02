@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import json
+import os
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,8 +21,10 @@ from googleapiclient.discovery import build
 from config import (
     ALLOWED_EXTENSIONS,
     CREDENTIALS_FILE,
+    GMAIL_CREDENTIALS_JSON,
     GMAIL_SCOPES,
     GMAIL_SEARCH_QUERY,
+    GMAIL_TOKEN_JSON,
     RAW_DIR,
     REPORT_FILE_MAPPING,
     RINGCENTRAL_URL_FRAGMENT,
@@ -35,11 +40,28 @@ class DownloadSummary:
     unmatched_subjects: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
-
 def get_gmail_service():
+    """Build the Gmail API service locally or on Railway."""
     creds = None
 
-    if TOKEN_FILE.exists():
+    token_json = GMAIL_TOKEN_JSON
+    credentials_json = GMAIL_CREDENTIALS_JSON
+
+    # Railway: load OAuth token from environment variable.
+    if token_json:
+        try:
+            token_info = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(
+                token_info,
+                GMAIL_SCOPES,
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "GMAIL_TOKEN_JSON no contiene un JSON válido."
+            ) from exc
+
+    # Local execution: use token.json when available.
+    elif TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(
             str(TOKEN_FILE),
             GMAIL_SCOPES,
@@ -49,18 +71,44 @@ def get_gmail_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError(
-                    f"No se encontró el archivo: {CREDENTIALS_FILE}"
+            # Railway cannot launch an interactive browser login.
+            if os.getenv("RAILWAY_ENVIRONMENT"):
+                if not token_json:
+                    raise RuntimeError(
+                        "Railway no recibió GMAIL_TOKEN_JSON. "
+                        "Agrégala en Variables del servicio ETL."
+                    )
+                raise RuntimeError(
+                    "GMAIL_TOKEN_JSON no es válido o no contiene "
+                    "un refresh_token utilizable."
                 )
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE),
-                GMAIL_SCOPES,
-            )
-            creds = flow.run_local_server(port=0)
+            # Local interactive authentication.
+            if credentials_json:
+                try:
+                    client_config = json.loads(credentials_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "GMAIL_CREDENTIALS_JSON no contiene un JSON válido."
+                    ) from exc
 
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+                flow = InstalledAppFlow.from_client_config(
+                    client_config,
+                    GMAIL_SCOPES,
+                )
+            else:
+                if not CREDENTIALS_FILE.exists():
+                    raise FileNotFoundError(
+                        f"No se encontró el archivo: {CREDENTIALS_FILE}"
+                    )
+
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(CREDENTIALS_FILE),
+                    GMAIL_SCOPES,
+                )
+
+            creds = flow.run_local_server(port=0)
+            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build(
         "gmail",

@@ -3,9 +3,6 @@ from __future__ import annotations
 import base64
 import logging
 import re
-import json
-import os
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,27 +35,11 @@ class DownloadSummary:
     unmatched_subjects: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
+
 def get_gmail_service():
     creds = None
 
-    token_json = os.getenv("GMAIL_TOKEN_JSON", "").strip()
-    credentials_json = os.getenv("GMAIL_CREDENTIALS_JSON", "").strip()
-
-    # Railway: cargar token directamente desde variable de entorno
-    if token_json:
-        try:
-            token_info = json.loads(token_json)
-            creds = Credentials.from_authorized_user_info(
-                token_info,
-                GMAIL_SCOPES,
-            )
-        except Exception as exc:
-            raise ValueError(
-                "GMAIL_TOKEN_JSON no contiene un JSON válido."
-            ) from exc
-
-    # Local: usar token.json
-    elif TOKEN_FILE.exists():
+    if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(
             str(TOKEN_FILE),
             GMAIL_SCOPES,
@@ -67,46 +48,19 @@ def get_gmail_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-
         else:
-            # Railway no puede abrir el navegador para autorizar Gmail
-            if os.getenv("RAILWAY_ENVIRONMENT"):
-                raise RuntimeError(
-                    "El token de Gmail no es válido o no contiene "
-                    "refresh_token. Actualiza GMAIL_TOKEN_JSON en Railway."
+            if not CREDENTIALS_FILE.exists():
+                raise FileNotFoundError(
+                    f"No se encontró el archivo: {CREDENTIALS_FILE}"
                 )
 
-            # Ejecución local interactiva
-            if credentials_json:
-                try:
-                    client_config = json.loads(credentials_json)
-                except Exception as exc:
-                    raise ValueError(
-                        "GMAIL_CREDENTIALS_JSON no contiene un JSON válido."
-                    ) from exc
-
-                flow = InstalledAppFlow.from_client_config(
-                    client_config,
-                    GMAIL_SCOPES,
-                )
-
-            else:
-                if not CREDENTIALS_FILE.exists():
-                    raise FileNotFoundError(
-                        f"No se encontró el archivo: {CREDENTIALS_FILE}"
-                    )
-
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    str(CREDENTIALS_FILE),
-                    GMAIL_SCOPES,
-                )
-
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(CREDENTIALS_FILE),
+                GMAIL_SCOPES,
+            )
             creds = flow.run_local_server(port=0)
 
-            TOKEN_FILE.write_text(
-                creds.to_json(),
-                encoding="utf-8",
-            )
+        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build(
         "gmail",

@@ -15,6 +15,7 @@ GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON", "").strip()
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
+# Búsqueda amplia; el descargador filtra estrictamente por la fecha de Bolivia.
 GMAIL_SEARCH_QUERY = (
     'newer_than:2d '
     '(subject:Streamlit '

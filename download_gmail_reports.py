@@ -7,6 +7,8 @@ import json
 import os
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -343,7 +345,13 @@ def download_ringcentral_report(
 
 
 def list_matching_messages(service) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
+    """Devuelve únicamente correos cuya fecha interna sea hoy en Bolivia.
+
+    La búsqueda de Gmail se mantiene amplia (2 días) para evitar perder
+    correos por diferencias de zona horaria. Después se filtra usando
+    internalDate, que es la fecha real registrada por Gmail.
+    """
+    candidate_messages: list[dict[str, Any]] = []
     page_token = None
 
     while True:
@@ -359,13 +367,47 @@ def list_matching_messages(service) -> list[dict[str, Any]]:
             .execute()
         )
 
-        messages.extend(response.get("messages", []))
+        candidate_messages.extend(response.get("messages", []))
         page_token = response.get("nextPageToken")
 
         if not page_token:
             break
 
-    return messages
+    bolivia_tz = ZoneInfo("America/La_Paz")
+    today_bolivia = datetime.now(bolivia_tz).date()
+    messages_today: list[dict[str, Any]] = []
+
+    for item in candidate_messages:
+        metadata = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=item["id"],
+                format="minimal",
+            )
+            .execute()
+        )
+
+        internal_date_ms = metadata.get("internalDate")
+        if not internal_date_ms:
+            continue
+
+        message_date = datetime.fromtimestamp(
+            int(internal_date_ms) / 1000,
+            tz=bolivia_tz,
+        ).date()
+
+        if message_date == today_bolivia:
+            messages_today.append(item)
+
+    print(
+        f"Correos candidatos: {len(candidate_messages)} | "
+        f"Correos de hoy en Bolivia ({today_bolivia}): "
+        f"{len(messages_today)}"
+    )
+
+    return messages_today
 
 
 def download_reports() -> DownloadSummary:

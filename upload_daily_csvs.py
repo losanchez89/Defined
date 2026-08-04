@@ -1,6 +1,5 @@
 from pathlib import Path
 from datetime import date
-from matplotlib.pylab import number
 import pandas as pd
 from streamlit import status
 from supabase_client import supabase

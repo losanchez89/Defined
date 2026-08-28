@@ -5892,53 +5892,34 @@ elif st.session_state.page == "Operations/Maintenance":
             if len(_overdue):
                 ag_l, ag_r = st.columns(2)
                 with ag_l:
-                    # Overdue WOs by property — pie chart.
-                    # Keep the largest properties visible and combine the rest into Other
-                    # so the pie always represents 100% of overdue work orders.
-                    _prop_aging_all = (
+                    # Overdue WOs by property — horizontal bar chart.
+                    # Show the Top 10 properties by number of overdue work orders.
+                    _prop_aging = (
                         _overdue.groupby("Property", dropna=False)
                         .size()
                         .reset_index(name="Overdue WOs")
                         .sort_values("Overdue WOs", ascending=False)
+                        .head(10)
+                        .sort_values("Overdue WOs", ascending=True)
                     )
-                    _pie_top_n = 9
-                    if len(_prop_aging_all) > _pie_top_n:
-                        _prop_aging = _prop_aging_all.head(_pie_top_n).copy()
-                        _other_count = int(_prop_aging_all.iloc[_pie_top_n:]["Overdue WOs"].sum())
-                        _prop_aging = pd.concat([
-                            _prop_aging,
-                            pd.DataFrame([{"Property": "Other", "Overdue WOs": _other_count}])
-                        ], ignore_index=True)
-                    else:
-                        _prop_aging = _prop_aging_all.copy()
 
-                    fig_aging_p = go.Figure(go.Pie(
-                        labels=_prop_aging["Property"],
-                        values=_prop_aging["Overdue WOs"],
-                        hole=0.50,
-                        sort=False,
-                        textinfo="percent",
-                        textposition="inside",
-                        hovertemplate="<b>%{label}</b><br>Overdue WOs: %{value}<br>%{percent}<extra></extra>",
+                    fig_aging_p = go.Figure(go.Bar(
+                        x=_prop_aging["Overdue WOs"],
+                        y=_prop_aging["Property"],
+                        orientation="h",
+                        text=_prop_aging["Overdue WOs"],
+                        textposition="outside",
+                        cliponaxis=False,
+                        hovertemplate="<b>%{y}</b><br>Overdue WOs: %{x}<extra></extra>",
                     ))
                     fig_aging_p.update_layout(
                         template="dfm",
                         height=390,
                         paper_bgcolor="#FFFFFF",
-                        margin=dict(l=10, r=10, t=10, b=10),
-                        legend=dict(
-                            orientation="v",
-                            yanchor="middle",
-                            y=0.5,
-                            xanchor="left",
-                            x=1.02,
-                            font=dict(size=9),
-                        ),
-                        annotations=[dict(
-                            text=f"<b>{_n_overdue:,}</b><br><span style='font-size:10px'>Overdue</span>",
-                            x=0.5, y=0.5, showarrow=False,
-                            font=dict(size=18, color="#0F172A"),
-                        )],
+                        margin=dict(l=10, r=45, t=10, b=35),
+                        showlegend=False,
+                        xaxis=dict(title="Overdue WOs", rangemode="tozero"),
+                        yaxis=dict(title=None, automargin=True),
                     )
                     section("Overdue by Property")
                     st.plotly_chart(fig_aging_p, width="stretch")

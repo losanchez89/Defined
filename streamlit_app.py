@@ -1051,6 +1051,124 @@ def _fetch_all(table: str, snap: str, page_size: int = 1000) -> list:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _available_snapshot_months(table: str, limit: int = 1000) -> list[pd.Period]:
+    """Return only calendar months that actually have snapshots in Supabase."""
+    try:
+        res = (
+            supabase.table(table)
+            .select("snapshot_date")
+            .order("snapshot_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        periods = []
+        seen = set()
+        for row in (res.data or []):
+            dt = pd.to_datetime(row.get("snapshot_date"), errors="coerce")
+            if pd.isna(dt):
+                continue
+            per = pd.Period(dt, freq="M")
+            key = (per.year, per.month)
+            if key not in seen:
+                periods.append(per)
+                seen.add(key)
+        return periods
+    except Exception as e:
+        log.warning("available months for %s failed: %s", table, e)
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _latest_snapshot_in_month(table: str, year: int, month: int) -> str | None:
+    """Latest snapshot_date inside the selected calendar month."""
+    import calendar as _cal
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{_cal.monthrange(year, month)[1]:02d}"
+    try:
+        res = (
+            supabase.table(table)
+            .select("snapshot_date")
+            .gte("snapshot_date", start)
+            .lte("snapshot_date", end)
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0]["snapshot_date"] if res.data else None
+    except Exception as e:
+        log.warning("snapshot for %s %04d-%02d failed: %s", table, year, month, e)
+        return None
+
+
+def _normalize_ah_rent_roll(rows: list) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).rename(columns={
+        "unit_id": "Unit ID", "market_rent": "Market Rent",
+        "lease_from": "Lease From", "lease_to": "Lease To",
+        "bd_ba": "BD/BA", "past_due": "Past Due", "portfolio": "Portfolio",
+        "property": "Property", "unit": "Unit", "status": "Status",
+        "tenant": "Tenant", "rent": "Rent", "deposit": "Deposit",
+    })
+    for col in ["Rent", "Market Rent", "Deposit", "Past Due"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    if "Status" in df.columns:
+        df["Status"] = df["Status"].astype(str).str.strip()
+    return filter_future_properties(df)
+
+
+def _normalize_ah_funnel(rows: list) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).rename(columns={
+        "property": "Property", "inquiries": "Inquiries",
+        "completed_showings": "Completed Showings",
+        "rental_apps": "Rental Apps", "decision_pending": "Decision Pending",
+        "approved": "Approved", "signed_leases": "Signed Leases",
+    })
+    for col in ["Inquiries", "Completed Showings", "Rental Apps", "Decision Pending", "Approved", "Signed Leases"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return filter_future_properties(df)
+
+
+def _normalize_ah_work_orders(rows: list) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates(subset=["id"] if "id" in pd.DataFrame(rows).columns else None).copy()
+    df = df.rename(columns={
+        "property": "Property", "unit": "Unit", "status": "Status",
+        "priority": "Priority", "amount": "Amount",
+        "created_at_raw": "Created At", "completed_on": "Completed On",
+        "days_to_resolve": "Days to Resolve", "work_order_issue": "Work Order Issue",
+        "vendor": "Vendor",
+    })
+    for col in ["Created At", "Completed On"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    if "Days to Resolve" in df.columns:
+        df["Days to Resolve"] = pd.to_numeric(df["Days to Resolve"], errors="coerce")
+    return filter_future_properties(df)
+
+
+def _normalize_ah_calls(rows: list):
+    if not rows:
+        return None, None
+    df = pd.DataFrame(rows).rename(columns={
+        "name": "Name", "ext": "Ext", "total_calls": "Total Calls",
+        "avg_daily": "Avg Daily", "inbound": "Inbound", "outbound": "Outbound",
+        "missed_with_vm": "Missed with VM", "missed_vm_pct": "Missed VM %",
+    })
+    for col in ["Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    ps = pd.to_datetime(df["period_start"].iloc[0], errors="coerce") if "period_start" in df.columns and len(df) else None
+    pe = pd.to_datetime(df["period_end"].iloc[0], errors="coerce") if "period_end" in df.columns and len(df) else None
+    return df.sort_values("Total Calls", ascending=False).reset_index(drop=True), {"start": ps, "end": pe}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _rent_roll():
     try:
         snap = _latest_snapshot("rent_roll")
@@ -1760,6 +1878,135 @@ def _showings_history(weeks: int = 8):
         return None
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _completed_showings_weekly_from_funnel(properties: tuple[str, ...] = (), weeks: int = 8):
+    """Rebuild weekly completed-showing counts from historical Leasing Funnel MTD snapshots.
+
+    The funnel stores Completed Showings by property as a month-to-date value on each
+    snapshot. Taking within-month changes reconstructs new showings between snapshots.
+    This preserves Portfolio/Property filtering and avoids relying on a single Showings
+    snapshot, which may not contain the full 8-week history.
+    """
+    try:
+        _today = pd.Timestamp(now().date())
+        _current_monday = _today - pd.Timedelta(days=_today.weekday())
+        _week_index = pd.DatetimeIndex(
+            pd.date_range(
+                start=_current_monday - pd.Timedelta(weeks=max(weeks - 1, 0)),
+                periods=weeks,
+                freq="W-MON",
+            ),
+            name="Week",
+        )
+
+        # Fetch from the first day of the earliest month so the first MTD delta in
+        # that month has a proper baseline.
+        _earliest = _week_index.min()
+        _query_start = _earliest.replace(day=1).date().isoformat()
+        _query_end = _today.date().isoformat()
+
+        rows, start = [], 0
+        while True:
+            batch = (
+                supabase.table("leasing_funnel")
+                .select("snapshot_date,property,completed_showings")
+                .gte("snapshot_date", _query_start)
+                .lte("snapshot_date", _query_end)
+                .range(start, start + 999)
+                .execute()
+                .data
+            )
+            rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            start += 1000
+
+        if not rows:
+            return pd.DataFrame({"Week": _week_index, "Count": [0] * len(_week_index)}), 0
+
+        d = pd.DataFrame(rows)
+        d["snapshot_date"] = pd.to_datetime(d["snapshot_date"], errors="coerce")
+        d["completed_showings"] = pd.to_numeric(d["completed_showings"], errors="coerce").fillna(0)
+        d = d.dropna(subset=["snapshot_date"])
+
+        if properties:
+            d = d[d["property"].isin(list(properties))].copy()
+
+        if d.empty:
+            return pd.DataFrame({"Week": _week_index, "Count": [0] * len(_week_index)}), 0
+
+        # Sum property MTD values at each snapshot.
+        daily_mtd = (
+            d.groupby("snapshot_date", as_index=False)["completed_showings"]
+            .sum()
+            .sort_values("snapshot_date")
+        )
+        daily_mtd["Month"] = daily_mtd["snapshot_date"].dt.to_period("M")
+
+        # Convert MTD totals into activity between snapshots. The first snapshot in
+        # each month already represents that month's activity up to that date.
+        daily_mtd["New Showings"] = daily_mtd.groupby("Month")["completed_showings"].diff()
+        first_in_month = daily_mtd.groupby("Month").cumcount().eq(0)
+        daily_mtd.loc[first_in_month, "New Showings"] = daily_mtd.loc[first_in_month, "completed_showings"]
+        daily_mtd["New Showings"] = pd.to_numeric(daily_mtd["New Showings"], errors="coerce").fillna(0)
+        daily_mtd["Week"] = daily_mtd["snapshot_date"].dt.to_period("W-SUN").dt.start_time
+
+        # Corrections can make a daily MTD delta negative. Keep the correction
+        # inside its week, but never display a negative count of completed showings.
+        weekly_raw = daily_mtd.groupby("Week")["New Showings"].sum()
+        weekly = pd.DataFrame({
+            "Week": _week_index,
+            "Count": [max(0, int(round(float(weekly_raw.get(w, 0))))) for w in _week_index],
+        })
+
+        # Same-days-prior comparison for the partial current week.
+        days_elapsed = int((_today - _current_monday).days)
+        prior_start = _current_monday - pd.Timedelta(days=7)
+        prior_end = prior_start + pd.Timedelta(days=days_elapsed, hours=23, minutes=59, seconds=59)
+        prior_same_raw = daily_mtd.loc[
+            (daily_mtd["snapshot_date"] >= prior_start)
+            & (daily_mtd["snapshot_date"] <= prior_end),
+            "New Showings",
+        ].sum()
+        prior_same = max(0, int(round(float(prior_same_raw))))
+        return weekly, prior_same
+    except Exception as e:
+        log.error("weekly completed showings from leasing_funnel failed: %s", e)
+        _today = pd.Timestamp(now().date())
+        _current_monday = _today - pd.Timedelta(days=_today.weekday())
+        _week_index = pd.DatetimeIndex(
+            pd.date_range(start=_current_monday - pd.Timedelta(weeks=max(weeks - 1, 0)), periods=weeks, freq="W-MON"),
+            name="Week",
+        )
+        return pd.DataFrame({"Week": _week_index, "Count": [0] * len(_week_index)}), 0
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lease_history(table: str = "lease_history"):
+    try:
+        snap = _latest_snapshot(table)
+        if not snap:
+            return None
+        rows = _fetch_all(table, snap)
+        if not rows:
+            return None
+        df = pd.DataFrame(rows).rename(columns={
+            "unit_name": "Unit Name", "property": "Property", "tenant_name": "Tenant Name",
+            "lease_start": "Lease Start", "lease_end": "Lease End", "rent": "Rent",
+            "status": "Status", "countersigned_date": "Countersigned Date",
+            "occupancy_name": "Occupancy Name",
+        })
+        for col in ["Lease Start", "Lease End", "Countersigned Date"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        if "Rent" in df.columns:
+            df["Rent"] = pd.to_numeric(df["Rent"], errors="coerce").fillna(0)
+        return filter_future_properties(df)
+    except Exception as e:
+        log.error("%s desde Supabase: %s", table, e)
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _tickler():
     try:
         snap = _latest_snapshot("tenant_tickler")
@@ -2318,6 +2565,8 @@ with st.spinner("Loading portfolio data…"):
     df_wo       = _work_orders()
     df_raw_show = _showings_raw()
     df_show_hist = _showings_history(weeks=8)
+    df_lease_history = _lease_history("lease_history")
+    df_lease_history_non_revenue = _lease_history("lease_history_non_revenue")
     df_tickler  = _tickler()
     df_renew    = _renewals()
     df_apps     = _applications()
@@ -2648,6 +2897,9 @@ else:
 df_wo_f      = _f(df_wo)
 df_funnel_f  = _f(df_funnel)
 df_show_hist_f = _f(df_show_hist)
+df_raw_show_f = _f(df_raw_show)
+df_lease_history_f = _f(df_lease_history)
+df_lease_history_non_revenue_f = _f(df_lease_history_non_revenue)
 df_tickler_f = _f(df_tickler)
 df_renew_f   = _f(df_renew)
 df_apps_f    = _f(df_apps, col="Property")
@@ -2686,6 +2938,149 @@ if st.session_state.page == "All Hands":
         st.warning("Data not available.")
         st.stop()
 
+    # ── Reporting month selector — All Hands only ─────────────────────────
+    # Always expose the last 12 calendar months. Older months are backed by
+    # historical_metrics when a full Rent Roll snapshot is not stored.
+    _ah_now = now()
+    _ah_current_period = pd.Period(pd.Timestamp(_ah_now.date()), freq="M")
+    _ah_periods = [_ah_current_period - i for i in range(12)]
+    _ah_month_options = [p.to_timestamp().strftime("%B %Y") for p in _ah_periods]
+
+    _prev_period = _ah_current_period - 1
+    _ah_default_idx = _ah_periods.index(_prev_period) if _prev_period in _ah_periods else 0
+
+    _ah_sel_col, _ah_sel_note = st.columns([2, 5])
+    with _ah_sel_col:
+        _ah_selected_label = st.selectbox(
+            "Reporting Month",
+            options=_ah_month_options,
+            index=_ah_default_idx,
+            key="all_hands_reporting_month",
+        )
+    _ah_selected_period = _ah_periods[_ah_month_options.index(_ah_selected_label)]
+    _ah_year = int(_ah_selected_period.year)
+    _ah_month = int(_ah_selected_period.month)
+    _month_lbl = _ah_selected_period.to_timestamp().strftime("%B %Y")
+
+    import calendar as _ah_calendar
+    _ah_last_day = _ah_calendar.monthrange(_ah_year, _ah_month)[1]
+    _ah_is_current_month = (_ah_year == _ah_now.year and _ah_month == _ah_now.month)
+    _ah_period_end_day = _ah_now.day if _ah_is_current_month else _ah_last_day
+    _mtd_label = f"{_ah_selected_period.to_timestamp().strftime('%b')} 1–{_ah_period_end_day}"
+
+    # Load the latest snapshot INSIDE the selected month for each snapshot table.
+    _ah_rr_snap = _latest_snapshot_in_month("rent_roll", _ah_year, _ah_month)
+    _ah_fun_snap = _latest_snapshot_in_month("leasing_funnel", _ah_year, _ah_month)
+    _ah_wo_snap = _latest_snapshot_in_month("work_orders", _ah_year, _ah_month)
+    _ah_calls_snap = _latest_snapshot_in_month("calls", _ah_year, _ah_month)
+
+    _ah_rr_all = _normalize_ah_rent_roll(_fetch_all("rent_roll", _ah_rr_snap)) if _ah_rr_snap else pd.DataFrame()
+    _ah_funnel = _normalize_ah_funnel(_fetch_all("leasing_funnel", _ah_fun_snap)) if _ah_fun_snap else pd.DataFrame()
+    _ah_wo_all = _normalize_ah_work_orders(_fetch_all("work_orders", _ah_wo_snap)) if _ah_wo_snap else pd.DataFrame()
+    _ah_calls, _ah_calls_meta = _normalize_ah_calls(_fetch_all("calls", _ah_calls_snap)) if _ah_calls_snap else (None, None)
+
+    # Apply the global Portfolio / Property filter to the selected-month snapshots.
+    _ah_rr_all = _f(_ah_rr_all) if len(_ah_rr_all) else _ah_rr_all
+    _ah_funnel = _f(_ah_funnel) if len(_ah_funnel) else _ah_funnel
+    _ah_wo_all = _f(_ah_wo_all) if len(_ah_wo_all) else _ah_wo_all
+
+    # Use selected-month data throughout All Hands. Prefer a full Rent Roll
+    # snapshot; otherwise fall back to the latest historical_metrics row in
+    # that month for portfolio-level KPIs. This avoids silently using September
+    # values when August/July is selected.
+    _ah_has_rr_snapshot = bool(len(_ah_rr_all))
+    _ah_hist_month = pd.DataFrame()
+    _ah_hist_row = None
+    if df_hist is not None and len(df_hist):
+        _ah_hist_month = df_hist.copy()
+        if "Date" in _ah_hist_month.columns:
+            _ah_hist_month["Date"] = pd.to_datetime(_ah_hist_month["Date"], errors="coerce")
+            _ah_hist_month = _ah_hist_month[
+                (_ah_hist_month["Date"].dt.year == _ah_year) &
+                (_ah_hist_month["Date"].dt.month == _ah_month)
+            ].sort_values("Date")
+            if len(_ah_hist_month):
+                _ah_hist_row = _ah_hist_month.iloc[-1]
+
+    _ah_historical_only = False
+    _ah_vac_total_hist = None
+    if _ah_has_rr_snapshot:
+        _ah_rr_valid = _ah_rr_all[_ah_rr_all["Status"].isin(VALID_STATUSES)].copy() if "Status" in _ah_rr_all.columns else _ah_rr_all.copy()
+        _ah_metrics = calculate_metrics(_ah_rr_valid, _ah_funnel if len(_ah_funnel) else None)
+        _ah_totals, _econ_occ, _phys_occ = calculate_totals_row(_ah_metrics)
+        _ah_totals["Total Units"] = len(_ah_rr_all)
+        _totals = _ah_totals
+        df_rr_f = _ah_rr_valid
+        df_metrics_f = _ah_metrics
+    elif _ah_hist_row is not None:
+        _ah_historical_only = True
+        def _hist_num(name, default=0.0):
+            try:
+                v = _ah_hist_row.get(name, default)
+                return default if pd.isna(v) else float(v)
+            except Exception:
+                return default
+        _tu_hist = int(round(_hist_num("Total Units", 0)))
+        _occ_hist = int(round(_hist_num("Occupied Units", 0)))
+        _vac_hist = int(round(_hist_num("Vacant Units", max(_tu_hist - _occ_hist, 0))))
+        _econ_occ = _hist_num("Economic Occupancy", 0.0)
+        _phys_occ = _hist_num("Physical Occupancy", 0.0)
+        _ah_vac_total_hist = _vac_hist
+        _totals = {
+            "Total Units": _tu_hist,
+            "Current": _occ_hist,
+            "Vacant-Unrented": 0,
+            "Vacant-Rented": 0,
+            "Notice-Unrented": 0,
+            "Notice-Rented": 0,
+            "Evict": 0,
+        }
+        # No historical unit-level Rent Roll exists for this month, so do not
+        # reuse today's unit detail under an older month.
+        df_rr_f = pd.DataFrame()
+        df_metrics_f = pd.DataFrame()
+    else:
+        st.warning(f"No historical data is available for {_month_lbl}.")
+        st.stop()
+
+    if _ah_calls is not None:
+        df_calls = _ah_calls
+        calls_meta = _ah_calls_meta
+    else:
+        df_calls = None
+        calls_meta = None
+
+    # Lease-expiration KPIs must also be anchored to the selected month snapshot,
+    # not to today's date/latest Rent Roll.
+    exp30 = exp60 = exp90 = 0
+    _ah_reference_date = pd.to_datetime(_ah_rr_snap, errors="coerce")
+    if pd.isna(_ah_reference_date):
+        _ah_reference_date = _ah_selected_period.end_time.normalize()
+    else:
+        _ah_reference_date = pd.Timestamp(_ah_reference_date).normalize()
+    if df_rr_f is not None and "Lease To" in df_rr_f.columns:
+        _ah_lt = pd.to_datetime(
+            df_rr_f.loc[df_rr_f["Status"] == "Current", "Lease To"],
+            errors="coerce",
+        )
+        exp30 = int(((_ah_lt >= _ah_reference_date) & (_ah_lt <= _ah_reference_date + pd.Timedelta(days=30))).sum())
+        exp60 = int(((_ah_lt >= _ah_reference_date) & (_ah_lt <= _ah_reference_date + pd.Timedelta(days=60))).sum())
+        exp90 = int(((_ah_lt >= _ah_reference_date) & (_ah_lt <= _ah_reference_date + pd.Timedelta(days=90))).sum())
+
+    with _ah_sel_note:
+        if _ah_has_rr_snapshot:
+            _snap_lbl = pd.to_datetime(_ah_rr_snap).strftime("%b %d, %Y") if _ah_rr_snap else "not available"
+            st.caption(
+                f"Showing {_month_lbl} using the latest Rent Roll snapshot inside that month "
+                f"({_snap_lbl})."
+            )
+        else:
+            _hist_lbl = pd.to_datetime(_ah_hist_row.get("Date")).strftime("%b %d, %Y") if _ah_hist_row is not None else "not available"
+            st.caption(
+                f"Showing {_month_lbl} from historical_metrics ({_hist_lbl}). "
+                "Detailed historical vacancy categories are not stored, so only total vacancies are shown for this month."
+            )
+
     # ── Snapshot values ────────────────────────────────────────────────────
     _tu   = int(_totals.get("Total Units", 0))
     _curr = int(_totals.get("Current", 0))
@@ -2696,14 +3091,17 @@ if st.session_state.page == "All Hands":
     _ev   = int(_totals.get("Evict", 0))
     _rgap = float(df_metrics_f["Revenue Gap ($)"].sum()) if "Revenue Gap ($)" in df_metrics_f.columns else 0
 
-    _rr_pct = 0.0
-    if df_renew_f is not None and "Status" in df_renew_f.columns:
-        _act = df_renew_f[df_renew_f["Status"].isin(["Renewed", "Did Not Renew"])]
-        if len(_act):
-            _rr_pct = len(_act[_act["Status"] == "Renewed"]) / len(_act) * 100
-
     _sum_rent = _pct_coll = 0.0
-    if df_rr_f is not None and "Rent" in df_rr_f.columns:
+    if _ah_historical_only and _ah_hist_row is not None:
+        try:
+            _sum_rent = float(_ah_hist_row.get("Sum of Rent", 0) or 0)
+        except Exception:
+            _sum_rent = 0.0
+        try:
+            _pct_coll = float(_ah_hist_row.get("Collection Rate", 0) or 0)
+        except Exception:
+            _pct_coll = 0.0
+    elif df_rr_f is not None and "Rent" in df_rr_f.columns:
         _curr_rr = df_rr_f[df_rr_f["Status"] == "Current"]
         _sum_rent = float(clean_money_column(_curr_rr["Rent"]).sum())
         if "Past Due" in _curr_rr.columns and _sum_rent > 0:
@@ -2712,38 +3110,54 @@ if st.session_state.page == "All Hands":
 
     _wo_open = _wo_total = _wo_completed = 0
     _wo_comp_pct = 0.0
-    _wo_month_label = now().strftime("%B %Y")
-    if df_wo_f is not None and "Status" in df_wo_f.columns:
-        # OPEN is a current portfolio-wide count, not limited to the current month.
-        # Per operations definition: Scheduled + Assigned + Work Done + New + Estimated.
-        _open_wo_statuses = {"scheduled", "assigned", "work done", "new", "estimated"}
-        _wo_status_all = df_wo_f["Status"].astype(str).str.strip().str.lower()
-        _wo_open = int(_wo_status_all.isin(_open_wo_statuses).sum())
+    _wo_month_label = _month_lbl
+    _df_wo_month = pd.DataFrame()
+    _open_wo_prop = pd.DataFrame()
+    # Work Orders are loaded from the latest full work-order snapshot because
+    # that dataset contains historical Created At dates. Then filter by the
+    # selected calendar month. This works even when no work_orders snapshot was
+    # saved during the selected month.
+    _ah_wo_source = df_wo_f.copy() if df_wo_f is not None else _ah_wo_all.copy()
+    if len(_ah_wo_source) and "Status" in _ah_wo_source.columns:
+        _df_wo_month = _ah_wo_source.copy()
+        if "Created At" in _df_wo_month.columns:
+            _wo_created = pd.to_datetime(_df_wo_month["Created At"], errors="coerce")
+            _df_wo_month = _df_wo_month[
+                (_wo_created.dt.year == _ah_year) & (_wo_created.dt.month == _ah_month)
+            ].copy()
 
-        # Total / Completed remain current-month activity metrics.
-        _df_wo_month = df_wo_f
-        if "Created At" in df_wo_f.columns:
-            _wo_created = pd.to_datetime(df_wo_f["Created At"], errors="coerce")
-            _now = now()
-            _df_wo_month = df_wo_f[(_wo_created.dt.year == _now.year) & (_wo_created.dt.month == _now.month)]
         _wo_status = _df_wo_month["Status"].astype(str).str.strip().str.lower()
-        _wo_completed = int(_wo_status.str.contains("completed", na=False).sum())
-        _wo_total     = len(_df_wo_month)
-        _wo_comp_pct  = (_wo_completed / _wo_total * 100) if _wo_total > 0 else 0.0
+        _wo_completed_mask = _wo_status.str.contains("completed", na=False)
 
-    # ── Monthly filters — All Hands only ─────────────────────────────────
-    _ah_now = now()
-    _ah_month, _ah_year = _ah_now.month, _ah_now.year
+        # All Hands definition: OPEN = every status except Completed /
+        # Completed No Need To Bill (and any other status containing "completed").
+        _wo_open_mask = ~_wo_completed_mask
+        _wo_open = int(_wo_open_mask.sum())
+        _wo_completed = int(_wo_completed_mask.sum())
+        _wo_total = len(_df_wo_month)
+        _wo_comp_pct = (_wo_completed / _wo_total * 100) if _wo_total > 0 else 0.0
+        _open_wo_prop = _df_wo_month[_wo_open_mask].copy()
 
-    # Query true monthly data across all snapshots (deduplicated)
-    _shows = int(leasing_summary.get("Showings", 0))
-    _apps_count = int(leasing_summary.get("Applications", 0))
-    _leased = int(leasing_summary.get("Leased", 0))
-    _inq = int(leasing_summary.get("Inquiries", 0))
+    # ── Monthly leasing — query the selected calendar month directly.
+    # monthly_leasing / fallback logic is month-specific and avoids using a
+    # September funnel snapshot when August or July is selected.
+    _monthly = _monthly_leasing(_ah_year, _ah_month)
+    _shows = int(_monthly.get("showings_completed", 0) or 0)
+    _apps_count = int(_monthly.get("applications", 0) or 0)
+    _leased = int(_monthly.get("leases_signed", 0) or 0)
+    _inq = int(_monthly.get("inquiries", 0) or 0)
+
+    # If the selected month has a property-level funnel snapshot, use it only
+    # when a Portfolio/Property filter is active, so filtered views remain scoped.
+    if SEL and len(_ah_funnel):
+        _inq = int(pd.to_numeric(_ah_funnel.get("Inquiries", 0), errors="coerce").fillna(0).sum()) if "Inquiries" in _ah_funnel.columns else 0
+        _shows = int(pd.to_numeric(_ah_funnel.get("Completed Showings", 0), errors="coerce").fillna(0).sum()) if "Completed Showings" in _ah_funnel.columns else 0
+        _apps_count = int(pd.to_numeric(_ah_funnel.get("Rental Apps", 0), errors="coerce").fillna(0).sum()) if "Rental Apps" in _ah_funnel.columns else 0
+        _leased = int(pd.to_numeric(_ah_funnel.get("Signed Leases", 0), errors="coerce").fillna(0).sum()) if "Signed Leases" in _ah_funnel.columns else 0
     # ── Alertas automáticas vs. snapshot anterior ─────────────────────────
-    if df_hist is not None and len(df_hist) >= 2:
-        _prev_snap = df_hist.iloc[-2]
-        _curr_snap = df_hist.iloc[-1]
+    if _ah_hist_month is not None and len(_ah_hist_month) >= 2:
+        _prev_snap = _ah_hist_month.iloc[-2]
+        _curr_snap = _ah_hist_month.iloc[-1]
         _alerts = []   # (level, metric, prev_val, curr_val, msg)
 
         def _snap_float(row, col):
@@ -2943,7 +3357,7 @@ if st.session_state.page == "All Hands":
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>{COMPANY} — All Hands {_ah_date}</title>
+<title>{COMPANY} — All Hands {_month_lbl}</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0;}}
   body{{font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:#0F172A;background:#fff;padding:32px 40px;}}
@@ -2973,7 +3387,7 @@ if st.session_state.page == "All Hands":
 </head>
 <body>
 <h1>{COMPANY}</h1>
-<div class="sub">All Hands Meeting Snapshot &nbsp;·&nbsp; {_ah_date}</div>
+<div class="sub">All Hands Meeting Snapshot &nbsp;·&nbsp; {_ah_date} &nbsp;·&nbsp; Reporting Month: {_month_lbl}</div>
 
 <h2>Occupancy</h2>
 <div class="grid">
@@ -2991,9 +3405,8 @@ if st.session_state.page == "All Hands":
   <div class="card"><div class="card-label">Potential Monthly Revenue Loss</div><div class="card-val">${_rgap:,.0f}</div></div>
 </div>
 
-<h2>Leasing</h2>
-<div class="grid">
-  <div class="card"><div class="card-label">Renewal Rate</div><div class="card-val">{_rr_pct:.1f}%</div><div class="card-sub">Target {THR['renewal_rate']}%</div></div>
+<h2>Leasing ({_month_lbl})</h2>
+<div class="grid" style="grid-template-columns:repeat(3,1fr);">
   <div class="card"><div class="card-label">Leases Signed</div><div class="card-val">{_leased:,}</div></div>
   <div class="card"><div class="card-label">Inquiries</div><div class="card-val">{_inq:,}</div></div>
   <div class="card"><div class="card-label">Showings</div><div class="card-val">{_shows:,}</div></div>
@@ -3003,7 +3416,7 @@ if st.session_state.page == "All Hands":
 <div class="grid">
   <div class="card"><div class="card-label">Total</div><div class="card-val">{_wo_total:,}</div></div>
   <div class="card"><div class="card-label">Completed</div><div class="card-val">{_wo_completed:,}</div><div class="card-sub">{_wo_comp_pct:.0f}% completion</div></div>
-  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">Scheduled · Assigned · Work Done · New · Estimated · all dates</div></div>
+  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">All statuses except Completed · selected month</div></div>
 </div>
 
 <h2>Communications — Calls</h2>
@@ -3092,7 +3505,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         st.download_button(
             "Export Report",
             data=_build_report_html(),
-            file_name=f"all_hands_{now().strftime('%Y-%m-%d')}.html",
+            file_name=f"all_hands_{_ah_year}-{_ah_month:02d}.html",
             mime="text/html",
             type="secondary",
         )
@@ -3121,11 +3534,17 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 
     # ── 5 KPI cards ───────────────────────────────────────────────────────
     a1, a2, a3 = st.columns(3)
-    _vac_total = _vu + _vr + _nu
+    _vac_total = int(_ah_vac_total_hist) if _ah_vac_total_hist is not None else (_vu + _vr + _nu)
+    _vac_sub = (
+        "Historical total · detailed categories not stored"
+        if _ah_historical_only
+        else f"{_vu} unrented · {_vr} rented · {_nu} on notice"
+    )
+    _vac_status_basis = _vac_total if _ah_historical_only else _vu
 
     with a1: st.markdown(kpi("Total Vacancies",f"{_vac_total:,}",
-                                status="bad" if _vu > 15 else "warn" if _vu > 8 else "good",
-                                sub=f"{_vu} unrented · {_vr} rented · {_nu} on notice"),unsafe_allow_html=True)
+                                status="bad" if _vac_status_basis > 15 else "warn" if _vac_status_basis > 8 else "good",
+                                sub=_vac_sub),unsafe_allow_html=True)
 
     with a2: st.markdown(kpi("Economic Occupancy",f"{_econ_occ:.1f}%",
                                 status=_tl(_econ_occ, THR["economic_occ"]),
@@ -3189,14 +3608,18 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         )
     with g3:
         # Portfolio composition donut
-        _comp = [(l, v, c) for l, v, c in [
-            ("Current",          _curr, "#1E40AF"),
-            ("Vacant · Unrented", _vu,   "#991B1B"),
-            ("Vacant · Rented",   _vr,   "#1D4ED8"),
-            ("Notice · Unrented", _nu,   "#B45309"),
-            ("Notice · Rented",   _nr,   "#065F46"),
-            ("In Eviction",       _ev,   "#7F1D1D"),
-        ] if v > 0]
+        if _ah_historical_only:
+            _comp = [("Occupied", _curr, "#1E40AF"), ("Vacant", _vac_total, "#991B1B")]
+            _comp = [x for x in _comp if x[1] > 0]
+        else:
+            _comp = [(l, v, c) for l, v, c in [
+                ("Current",          _curr, "#1E40AF"),
+                ("Vacant · Unrented", _vu,   "#991B1B"),
+                ("Vacant · Rented",   _vr,   "#1D4ED8"),
+                ("Notice · Unrented", _nu,   "#B45309"),
+                ("Notice · Rented",   _nr,   "#065F46"),
+                ("In Eviction",       _ev,   "#7F1D1D"),
+            ] if v > 0]
         if _comp:
             _cl, _cv, _cc = zip(*_comp)
             fig_comp = go.Figure(go.Pie(
@@ -3223,9 +3646,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             st.plotly_chart(fig_comp, width="stretch")
 
 
-    # ── Row B: Leasing activity KPIs | Vacancy pipeline | This month ─────
-    _month_lbl  = _ah_now.strftime('%B %Y')
-    _mtd_label = f"{_ah_now.strftime('%b')} 1–{_ah_now.day}"  # e.g. "May 1–7"
+    # ── Row B: Leasing activity KPIs | Vacancy pipeline | Selected month ─
     col_f, col_p, col_w = st.columns(3)
 
     # Monthly move-ins from tickler (the only source with exact event dates)
@@ -3258,13 +3679,18 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
 
     with col_p:
         section("Vacancy Pipeline")
-        for label, val, color in [
-            ("Vacant · Unrented",  _vu,  "#991B1B"),
-            ("Notice · Unrented",  _nu,  "#B45309"),
-            ("In Eviction",        _ev,  "#7F1D1D"),
-            ("Expiring (30 days)", exp30, "#D97706"),
-            ("Expiring (60 days)", exp60, "#F59E0B"),
-        ]:
+        _vacancy_rows = (
+            [("Total Vacancies", _vac_total, "#991B1B")]
+            if _ah_historical_only
+            else [
+                ("Vacant · Unrented",  _vu,  "#991B1B"),
+                ("Notice · Unrented",  _nu,  "#B45309"),
+                ("In Eviction",        _ev,  "#7F1D1D"),
+                ("Expiring (30 days)", exp30, "#D97706"),
+                ("Expiring (60 days)", exp60, "#F59E0B"),
+            ]
+        )
+        for label, val, color in _vacancy_rows:
             st.markdown(
                 f'<div style="display:flex;justify-content:space-between;align-items:center;'
                 f'padding:9px 14px;margin-bottom:5px;border-radius:7px;background:#F8FAFC;'
@@ -3276,7 +3702,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             )
 
     with col_w:
-        section(f"This Month · {_month_lbl}  ·  {_mtd_label}")
+        section(f"Selected Month · {_month_lbl}  ·  {_mtd_label}")
         _week = [
             (f"Leases Signed",         _leased,           "#059669"),
             (f"Move-ins",              _move_ins_monthly, "#0D9488"),
@@ -3392,30 +3818,28 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                 st.plotly_chart(fig_coll, width="stretch")
 
     with _col_wo:
-        if df_wo_f is not None and (_wo_total > 0 or _wo_open > 0):
+        if len(_ah_wo_all) and (_wo_total > 0 or _wo_open > 0):
             section(f"Work Orders · {_wo_month_label}")
             wo1, wo2 = st.columns(2)
             with wo1: st.markdown(kpi("Total", f"{_wo_total:,}",
                                        sub=f"{_wo_comp_pct:.0f}% completed"), unsafe_allow_html=True)
             with wo2: st.markdown(kpi("Open", f"{_wo_open:,}",
                                        status="bad" if _wo_open > 30 else "warn" if _wo_open > 15 else "good",
-                                       sub="Scheduled · Assigned · Work Done · New · Estimated · all dates"), unsafe_allow_html=True)
+                                       sub="All statuses except Completed · selected month"), unsafe_allow_html=True)
             wo3, wo4 = st.columns(2)
             with wo3: st.markdown(kpi("Completed", f"{_wo_completed:,}",
                                        status="good" if _wo_comp_pct >= 70 else "warn" if _wo_comp_pct >= 50 else "bad",
                                        sub=f"{_wo_comp_pct:.0f}% rate"), unsafe_allow_html=True)
             with wo4:
                 _wo_avg_res = 0.0
-                if "Days to Resolve" in df_wo_f.columns:
-                    _completed_wo = df_wo_f[df_wo_f["Status"].astype(str).str.lower().str.contains("completed", na=False)]
+                if "Days to Resolve" in _df_wo_month.columns:
+                    _completed_wo = _df_wo_month[_df_wo_month["Status"].astype(str).str.lower().str.contains("completed", na=False)]
                     _res_v = _completed_wo["Days to Resolve"].dropna()
                     _wo_avg_res = float(_res_v.mean()) if len(_res_v) else 0.0
                 st.markdown(kpi("Avg Resolve", f"{_wo_avg_res:.1f}d",
                                  status=_tl(_wo_avg_res, THR["wo_resolution_days"], "lower"),
                                  sub=f"Target ≤ {THR['wo_resolution_days']}d"), unsafe_allow_html=True)
-            # Open WOs by property chart — all active WOs across all dates
-            _wo_s = df_wo_f["Status"].astype(str).str.strip().str.lower()
-            _open_wo_prop = df_wo_f[_wo_s.isin(_open_wo_statuses)].copy()
+            # Open WOs by property chart — selected month, every non-completed status.
             if len(_open_wo_prop) > 0 and "Property" in _open_wo_prop.columns:
                 _owp = (
                     _open_wo_prop.groupby("Property").size()
@@ -3467,7 +3891,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         with _le_chart:
             # Per-property expiration breakdown for the next 30 days
             if df_rr_f is not None and "Lease To" in df_rr_f.columns and _exp_30d > 0:
-                _today_norm = pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).normalize()
+                _today_norm = _ah_reference_date
                 _act_lt = df_rr_f[df_rr_f["Status"].isin(["Current", "Notice-Unrented", "Notice-Rented"])].copy()
                 _lt_ser = pd.to_datetime(_act_lt["Lease To"], errors="coerce")
                 _act_lt["_days"] = (_lt_ser - _today_norm).dt.days
@@ -4444,6 +4868,9 @@ elif st.session_state.page == "Leasing":
     except Exception:
         _leasing_snap_lbl = _leasing_snap
     page_header("Leasing", f"AppFolio report · {_leasing_snap_lbl}")
+    _active_pf_label = st.session_state.portfolio_filter
+    _active_prop_label = ", ".join(st.session_state.prop_filter) if st.session_state.prop_filter else "All Properties"
+    st.caption(f"Portfolio: {_active_pf_label}  ·  Property: {_active_prop_label}")
 
     # ── Funnel ───────────────────────────────────────────────────────────
     section(f"Leasing Conversion Funnel · {_leasing_snap_lbl}")
@@ -4451,7 +4878,7 @@ elif st.session_state.page == "Leasing":
         inq  = int(df_funnel_f.get("Inquiries",          pd.Series([0])).sum()) if "Inquiries"          in df_funnel_f else 0
         shw  = int(df_funnel_f.get("Completed Showings",  pd.Series([0])).sum()) if "Completed Showings" in df_funnel_f else 0
         apps = int(df_funnel_f.get("Rental Apps",         pd.Series([0])).sum()) if "Rental Apps"        in df_funnel_f else 0
-        lsd  = leasing_summary.get("Leased", 0)  # from leasing_summary CSV (authoritative)
+        lsd  = int(df_funnel_f.get("Signed Leases", pd.Series([0])).sum()) if SEL and "Signed Leases" in df_funnel_f else leasing_summary.get("Leased", 0)
 
         s2l = (lsd / shw  * 100) if shw  > 0 else 0
         i2l = (lsd / inq  * 100) if inq  > 0 else 0
@@ -4510,182 +4937,115 @@ elif st.session_state.page == "Leasing":
         )
         st.plotly_chart(fig_fn, width="stretch")
 
-    # ── Showings — weekly trend + In-Person vs Virtual ────────────────────
-    section(f"Showings Analysis · {_leasing_snap_lbl}")
-    if df_raw_show is not None and "Status" in df_raw_show.columns:
-        # Latest snapshot is still used for the type breakdown; the weekly chart uses
-        # deduplicated history so it can show a meaningful multi-week trend.
-        df_s = df_raw_show.copy()
-        df_s["Showing Time"] = pd.to_datetime(df_s["Showing Time"], errors="coerce")
-        df_comp = df_s[df_s["Status"].astype(str).str.strip().str.lower() == "completed"].dropna(subset=["Showing Time"])
+    # ── Weekly Leasing Performance ─────────────────────────────────────
+    section(f"Weekly Leasing Performance · {_leasing_snap_lbl}")
 
-        # Weekly completed showings come from historical_metrics.Showings.
-        # IMPORTANT: historical_metrics stores Showings as a MONTH-TO-DATE cumulative value,
-        # so we first convert the MTD series into net daily changes, resetting at each month.
-        _hm = df_hist.copy() if df_hist is not None else pd.DataFrame()
-        if len(_hm):
-            _hm = _hm.rename(columns={
-                "date": "Date",
-                "showings": "Showings",
-            })
-            if "Date" in _hm.columns and "Showings" in _hm.columns:
-                _hm["Date"] = pd.to_datetime(_hm["Date"], errors="coerce").dt.normalize()
-                _hm["Showings"] = pd.to_numeric(_hm["Showings"], errors="coerce")
-                _hm = (
-                    _hm.dropna(subset=["Date", "Showings"])
-                    .sort_values("Date")
-                    .drop_duplicates(subset=["Date"], keep="last")
-                    .reset_index(drop=True)
-                )
-                _hm["Month"] = _hm["Date"].dt.to_period("M")
-                _hm["Daily Showings"] = _hm.groupby("Month")["Showings"].diff()
+    _today = pd.Timestamp(now().date())
+    _current_monday = _today - pd.Timedelta(days=_today.weekday())
+    _week_index = pd.DatetimeIndex(
+        pd.date_range(start=_current_monday - pd.Timedelta(weeks=7), periods=8, freq="W-MON"),
+        name="Week",
+    )
 
-                # The first snapshot of a month is itself the MTD total up to that date.
-                # This also handles a month whose first available snapshot is after day 1.
-                _first_in_month = _hm.groupby("Month").cumcount().eq(0)
-                _hm.loc[_first_in_month, "Daily Showings"] = _hm.loc[_first_in_month, "Showings"]
+    def _weekly_counts(df, date_col, status_col=None, completed_only=False):
+        if df is None or len(df) == 0 or date_col not in df.columns:
+            return pd.DataFrame({"Week": _week_index, "Count": [0] * len(_week_index)})
+        d = df.copy()
+        d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+        d = d.dropna(subset=[date_col])
+        if completed_only and status_col and status_col in d.columns:
+            d = d[d[status_col].astype(str).str.strip().str.lower().eq("completed")].copy()
+        d = d[(d[date_col] >= _week_index.min()) & (d[date_col] < _current_monday + pd.Timedelta(days=7))]
+        d["Week"] = d[date_col].dt.to_period("W-SUN").dt.start_time
+        counts = d.groupby("Week").size()
+        # Build the output explicitly so an empty/filtered result always keeps
+        # the expected Week/Count columns (avoids pandas reset_index naming issues).
+        out = pd.DataFrame({
+            "Week": _week_index,
+            "Count": [int(counts.get(w, 0)) for w in _week_index],
+        })
+        return out
 
-                # Preserve official MTD corrections (negative daily revisions) rather than
-                # forcing them positive; the weekly total will reconcile to the latest MTD.
-                _hm["Daily Showings"] = _hm["Daily Showings"].fillna(0)
-            else:
-                _hm = pd.DataFrame()
+    def _week_labels(w):
+        w = w.copy()
+        w["Week End"] = w["Week"] + pd.Timedelta(days=6)
+        w["Label"] = w.apply(lambda r: (
+            f"{r['Week'].strftime('%b')} {r['Week'].day}–{r['Week End'].day}"
+            if r["Week"].month == r["Week End"].month
+            else f"{r['Week'].strftime('%b')} {r['Week'].day}–{r['Week End'].strftime('%b')} {r['Week End'].day}"
+        ), axis=1)
+        if len(w):
+            w.loc[w.index[-1], "Label"] += " · Current Week"
+        return w
 
-        col_wk, col_type = st.columns([3, 2])
-        with col_wk:
-            if len(_hm):
-                _today = pd.Timestamp(now().date())
-                _current_monday = _today - pd.Timedelta(days=_today.weekday())
-                week_index = pd.date_range(
-                    start=_current_monday - pd.Timedelta(weeks=7),
-                    periods=8,
-                    freq="W-MON",
-                )
+    # Completed Showings: use historical Leasing Funnel MTD snapshots. This gives
+    # a true 8-week trend and still respects the global Portfolio/Property filter.
+    _show_weekly, _show_prior_same = _completed_showings_weekly_from_funnel(tuple(SEL), weeks=8)
+    _show_source = None  # weekly KPI delta is supplied by the reconstructed funnel history
+    _include_nr = st.toggle(
+        "Include Non-Revenue Units", value=False,
+        help="Switch Signed Leases to the Lease History report generated with Include Non-Revenue Units enabled.",
+        key="leasing_include_non_revenue",
+    )
+    _lease_base = df_lease_history_non_revenue_f if _include_nr else df_lease_history_f
+    _lease_weekly = _weekly_counts(_lease_base, "Countersigned Date", "Status", completed_only=True)
 
-                _hm["Week"] = _hm["Date"].dt.to_period("W-SUN").dt.start_time
-                weekly = _hm.groupby("Week")["Daily Showings"].sum().rename("Showings")
-                weekly = (
-                    weekly.reindex(week_index, fill_value=0)
-                    .rename_axis("Week")
-                    .reset_index()
-                )
-                weekly["Showings"] = weekly["Showings"].round().astype(int)
+    def _weekly_kpis(w, source_df, date_col, status_col=None):
+        this_week = int(w["Count"].iloc[-1]) if len(w) else 0
+        prior_week = int(w["Count"].iloc[-2]) if len(w) >= 2 else 0
+        avg4 = float(w.iloc[-5:-1]["Count"].mean()) if len(w) >= 5 else float(w.iloc[:-1]["Count"].tail(4).mean() or 0)
+        days_elapsed = int((_today - _current_monday).days)
+        prior_same = 0
+        if source_df is not None and len(source_df) and date_col in source_df.columns:
+            d = source_df.copy()
+            d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+            if status_col and status_col in d.columns:
+                d = d[d[status_col].astype(str).str.strip().str.lower().eq("completed")]
+            ps = _current_monday - pd.Timedelta(days=7)
+            pe = ps + pd.Timedelta(days=days_elapsed, hours=23, minutes=59, seconds=59)
+            prior_same = int(((d[date_col] >= ps) & (d[date_col] <= pe)).sum())
+        return this_week, prior_week, avg4, this_week - prior_same
 
-                weekly["Week End"] = weekly["Week"] + pd.Timedelta(days=6)
-                weekly["Week Label"] = weekly.apply(
-                    lambda r: (
-                        f"{r['Week'].strftime('%b')} {r['Week'].day}–{r['Week End'].day}"
-                        if r["Week"].month == r["Week End"].month
-                        else f"{r['Week'].strftime('%b')} {r['Week'].day}–{r['Week End'].strftime('%b')} {r['Week End'].day}"
-                    ),
-                    axis=1,
-                )
+    _sw_this = int(_show_weekly["Count"].iloc[-1]) if len(_show_weekly) else 0
+    _sw_prior = int(_show_weekly["Count"].iloc[-2]) if len(_show_weekly) >= 2 else 0
+    _sw_avg4 = float(_show_weekly.iloc[-5:-1]["Count"].mean()) if len(_show_weekly) >= 5 else 0.0
+    _sw_delta = _sw_this - _show_prior_same
+    _sl_this, _sl_prior, _sl_avg4, _sl_delta = _weekly_kpis(_lease_weekly, _lease_base, "Countersigned Date", "Status")
 
-                # Executive weekly KPIs. The current week is partial, so its delta is
-                # compared with the SAME number of weekdays from the prior week.
-                _current_week = weekly["Week"].iloc[-1] if len(weekly) else _current_monday
-                _current_week_end = min(_today, _hm["Date"].max())
-                _days_elapsed = max(0, int((_current_week_end - _current_week).days))
+    _left, _right = st.columns(2)
+    with _left:
+        st.markdown("**Completed Showings**")
+        a,b,c = st.columns(3)
+        with a: st.metric("This Week", f"{_sw_this:,}", delta=f"{_sw_delta:+,} vs same days prior")
+        with b: st.metric("Prior Week", f"{_sw_prior:,}")
+        with c: st.metric("4-Week Avg", f"{_sw_avg4:.1f}")
+        _sw_plot = _week_labels(_show_weekly)
+        fig_sw = go.Figure(go.Bar(x=_sw_plot["Label"], y=_sw_plot["Count"], marker_color=PC, text=_sw_plot["Count"], textposition="outside", cliponaxis=False))
+        fig_sw.update_layout(template="dfm", height=330, title=dict(text="Completed Showings by Week", x=0.01), showlegend=False, paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF", margin=dict(l=10,r=10,t=45,b=70), xaxis=dict(tickangle=-20, tickfont=dict(size=9), showgrid=False), yaxis=dict(title="Completed showings", rangemode="tozero", gridcolor="#F1F5F9"))
+        st.plotly_chart(fig_sw, width="stretch")
 
-                _this_week = int(weekly["Showings"].iloc[-1]) if len(weekly) else 0
-                _prior_week = int(weekly["Showings"].iloc[-2]) if len(weekly) >= 2 else 0
-
-                _prior_same_start = _current_week - pd.Timedelta(days=7)
-                _prior_same_end = _prior_same_start + pd.Timedelta(days=_days_elapsed)
-                _prior_same_days = int(round(_hm.loc[
-                    (_hm["Date"] >= _prior_same_start) &
-                    (_hm["Date"] <= _prior_same_end),
-                    "Daily Showings"
-                ].sum()))
-                _same_day_delta = _this_week - _prior_same_days
-
-                # 4-week average uses the four most recent COMPLETE weeks only.
-                _complete_weekly = weekly[weekly["Week End"] < _current_week].copy()
-                _avg4 = float(_complete_weekly.tail(4)["Showings"].mean()) if len(_complete_weekly) else 0.0
-
-                _wk1, _wk2, _wk3 = st.columns(3)
-                with _wk1:
-                    st.metric(
-                        "This Week",
-                        f"{_this_week:,}",
-                        delta=f"{_same_day_delta:+,} vs same days prior",
-                    )
-                with _wk2:
-                    st.metric("Prior Week", f"{_prior_week:,}")
-                with _wk3:
-                    st.metric("4-Week Avg", f"{_avg4:.1f}")
-
-                # Mark the current week as partial in the x-axis label.
-                if len(weekly):
-                    weekly.loc[weekly.index[-1], "Week Label"] = (
-                        weekly.loc[weekly.index[-1], "Week Label"] + " · partial"
-                    )
-
-                fig_w = go.Figure()
-                fig_w.add_trace(go.Bar(
-                    x=weekly["Week Label"],
-                    y=weekly["Showings"],
-                    name="Completed Showings",
-                    marker_color=PC,
-                    text=weekly["Showings"].astype(str),
-                    textposition="outside",
-                    textfont=dict(size=11),
-                    cliponaxis=False,
-                    hovertemplate=(
-                        "<b>%{x}</b><br>"
-                        "Completed showings: %{y:,.0f}"
-                        "<extra></extra>"
-                    ),
-                ))
-                _max_weekly = max(float(weekly["Showings"].max()), 0)
-                _ymax = max(_max_weekly * 1.22, 1)
-                fig_w.update_layout(
-                    template="dfm",
-                    height=350,
-                    title=dict(text="Completed Showings by Week", x=0.01, xanchor="left"),
-                    xaxis=dict(
-                        title="",
-                        type="category",
-                        categoryorder="array",
-                        categoryarray=weekly["Week Label"].tolist(),
-                        showgrid=False,
-                        tickfont=dict(size=9),
-                        tickangle=-20,
-                    ),
-                    yaxis=dict(
-                        title="Completed showings",
-                        range=[0, _ymax],
-                        gridcolor="#F1F5F9",
-                        zeroline=True,
-                        zerolinecolor="#CBD5E1",
-                    ),
-                    paper_bgcolor="#FFFFFF",
-                    plot_bgcolor="#FFFFFF",
-                    showlegend=False,
-                    bargap=0.28,
-                    margin=dict(l=10, r=10, t=45, b=70),
-                )
-                st.plotly_chart(fig_w, width="stretch")
-            else:
-                st.info("Historical showings data is not available in historical_metrics.")
-        with col_type:
-            if "Type" in df_comp.columns:
-                type_cnt = df_comp["Type"].value_counts().reset_index()
-                type_cnt.columns = ["Type","Count"]
-                fig_t = go.Figure(go.Pie(
-                    labels=type_cnt["Type"], values=type_cnt["Count"],
-                    hole=0.55, marker=dict(colors=[PC,"#93C5FD","#34D399"]),
-                    textinfo="label+percent",
-                ))
-                fig_t.update_layout(template="dfm", height=260,
-                                    title="Showing Type Breakdown",
-                                    showlegend=False, paper_bgcolor="#FFFFFF",
-                                    margin=dict(l=10,r=10,t=30,b=10))
-                st.plotly_chart(fig_t, width="stretch")
+    with _right:
+        st.markdown("**Signed Leases**")
+        a,b,c = st.columns(3)
+        with a: st.metric("This Week", f"{_sl_this:,}", delta=f"{_sl_delta:+,} vs same days prior")
+        with b: st.metric("Prior Week", f"{_sl_prior:,}")
+        with c: st.metric("4-Week Avg", f"{_sl_avg4:.1f}")
+        _sl_plot = _week_labels(_lease_weekly)
+        fig_sl = go.Figure(go.Bar(x=_sl_plot["Label"], y=_sl_plot["Count"], marker_color="#059669", text=_sl_plot["Count"], textposition="outside", cliponaxis=False))
+        fig_sl.update_layout(template="dfm", height=330, title=dict(text="Signed Leases by Week", x=0.01), showlegend=False, paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF", margin=dict(l=10,r=10,t=45,b=70), xaxis=dict(tickangle=-20, tickfont=dict(size=9), showgrid=False), yaxis=dict(title="Signed leases", rangemode="tozero", gridcolor="#F1F5F9"))
+        st.plotly_chart(fig_sl, width="stretch")
 
     # ── Applications ──────────────────────────────────────────────────────
     section(f"Application Pipeline · {_leasing_snap_lbl}")
     if df_apps_f is not None and len(df_apps_f):
+        _app_status = df_apps_f["Status"].astype(str).str.strip().str.lower() if "Status" in df_apps_f.columns else pd.Series(dtype=str)
+        _new_apps = int(_app_status.eq("new").sum())
+        _pending_apps = int(_app_status.str.contains("decision pending", na=False).sum())
+        _approved_apps = int(_app_status.str.contains("approved", na=False).sum())
+        _a1, _a2, _a3 = st.columns(3)
+        with _a1: st.markdown(kpi("New Applications", f"{_new_apps:,}"), unsafe_allow_html=True)
+        with _a2: st.markdown(kpi("Decision Pending", f"{_pending_apps:,}"), unsafe_allow_html=True)
+        with _a3: st.markdown(kpi("Approved", f"{_approved_apps:,}"), unsafe_allow_html=True)
         col_st, col_src = st.columns(2)
         with col_st:
             if "Status" in df_apps_f.columns:
@@ -4724,30 +5084,69 @@ elif st.session_state.page == "Leasing":
     
     if df_leads_f is not None and len(df_leads_f):
         active = df_leads_f[df_leads_f["Status"].astype(str).str.lower() == "active"].copy()
+        _lead_key_cols = [c for c in ["Name", "Property", "Email", "Phone"] if c in active.columns]
+        if _lead_key_cols:
+            active = active.drop_duplicates(subset=_lead_key_cols, keep="last").copy()
+        # Recalculate Lead Score on the documented 0-100 scale instead of
+        # clipping the legacy ETL score (which used a different formula).
+        for _c in ["Monthly Income", "Max Rent", "Credit Score"]:
+            if _c in active.columns:
+                active[_c] = pd.to_numeric(active[_c], errors="coerce")
+
+        if {"Monthly Income", "Max Rent", "Credit Score"}.issubset(active.columns):
+            _valid_score = (
+                active["Monthly Income"].gt(0)
+                & active["Max Rent"].gt(0)
+                & active["Credit Score"].notna()
+            )
+            active["Lead Score"] = pd.NA
+            _income_ratio = (
+                active.loc[_valid_score, "Monthly Income"]
+                / (active.loc[_valid_score, "Max Rent"] * 3.0)
+            )
+            _income_pts = (_income_ratio.clip(lower=0, upper=1) * 40.0)
+            _credit_pts = (
+                ((active.loc[_valid_score, "Credit Score"] - 580.0) / (820.0 - 580.0))
+                .clip(lower=0, upper=1)
+                * 40.0
+            )
+            _status_pts = active.loc[_valid_score, "Status"].astype(str).str.lower().map({
+                "active": 20.0, "inactive": 8.0, "cold": 2.0
+            }).fillna(0.0)
+            active.loc[_valid_score, "Lead Score"] = (_income_pts + _credit_pts + _status_pts).round(2)
+            active["Lead Score"] = pd.to_numeric(active["Lead Score"], errors="coerce")
+        elif "Lead Score" in active.columns:
+            active["Lead Score"] = pd.to_numeric(active["Lead Score"], errors="coerce")
+
         if len(active):
             c1, c2, c3 = st.columns(3)
             with c1: st.markdown(kpi("Active Leads", f"{len(active):,}",
                                       sub="Guest cards with Active status"), unsafe_allow_html=True)
-            _raw_score = active["Lead Score"].mean() if "Lead Score" in active.columns else 0
-            avg_score = float(_raw_score) if pd.notna(_raw_score) else 0.0
+            _score_series = (
+                pd.to_numeric(active["Lead Score"], errors="coerce").dropna()
+                if "Lead Score" in active.columns else pd.Series(dtype=float)
+            )
+            avg_score = float(_score_series.mean()) if len(_score_series) else 0.0
+            _scored_leads = int(len(_score_series))
             score_color = "#DC2626" if avg_score < 40 else ("#D97706" if avg_score < 70 else "#059669")
             score_label = "Cold" if avg_score < 40 else ("Warm" if avg_score < 70 else "Hot")
             with c2:
                 st.markdown(kpi("Avg Lead Score", f"{avg_score:.0f}/100",
                                 status="bad" if avg_score < 40 else ("warn" if avg_score < 70 else "good"),
-                                sub=f"Quality: {score_label}"),
+                                sub=f"Quality: {score_label} · {_scored_leads:,} scored leads"),
                             unsafe_allow_html=True)
             
             avg_inc = 0
+            _income = pd.Series(dtype=float)
 
             if "Monthly Income" in active.columns:
                 _income = active.loc[
-                    active["Monthly Income"] > 0,
+                    pd.to_numeric(active["Monthly Income"], errors="coerce") > 0,
                     "Monthly Income"
                 ]
 
             if len(_income):
-                avg_inc = float(_income.median())
+                avg_inc = float(pd.to_numeric(_income, errors="coerce").dropna().median())
 
             with c3:
                 st.markdown(

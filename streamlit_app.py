@@ -2944,12 +2944,15 @@ if st.session_state.page == "All Hands":
     _ah_now = now()
     _ah_current_period = pd.Period(pd.Timestamp(_ah_now.date()), freq="M")
     _ah_periods = [_ah_current_period - i for i in range(12)]
-    _ah_month_options = [p.to_timestamp().strftime("%B %Y") for p in _ah_periods]
+    _ah_month_options = ["Current Month"] + [
+        p.to_timestamp().strftime("%B %Y") for p in _ah_periods[1:]
+    ]
 
-    _prev_period = _ah_current_period - 1
-    _ah_default_idx = _ah_periods.index(_prev_period) if _prev_period in _ah_periods else 0
+    # Open All Hands on the current reporting month by default. Historical
+    # months remain available in the selector below.
+    _ah_default_idx = 0
 
-    _ah_sel_col, _ah_sel_note = st.columns([2, 5])
+    _ah_sel_col, _ = st.columns([2, 5])
     with _ah_sel_col:
         _ah_selected_label = st.selectbox(
             "Reporting Month",
@@ -3067,20 +3070,6 @@ if st.session_state.page == "All Hands":
         exp60 = int(((_ah_lt >= _ah_reference_date) & (_ah_lt <= _ah_reference_date + pd.Timedelta(days=60))).sum())
         exp90 = int(((_ah_lt >= _ah_reference_date) & (_ah_lt <= _ah_reference_date + pd.Timedelta(days=90))).sum())
 
-    with _ah_sel_note:
-        if _ah_has_rr_snapshot:
-            _snap_lbl = pd.to_datetime(_ah_rr_snap).strftime("%b %d, %Y") if _ah_rr_snap else "not available"
-            st.caption(
-                f"Showing {_month_lbl} using the latest Rent Roll snapshot inside that month "
-                f"({_snap_lbl})."
-            )
-        else:
-            _hist_lbl = pd.to_datetime(_ah_hist_row.get("Date")).strftime("%b %d, %Y") if _ah_hist_row is not None else "not available"
-            st.caption(
-                f"Showing {_month_lbl} from historical_metrics ({_hist_lbl}). "
-                "Detailed historical vacancy categories are not stored, so only total vacancies are shown for this month."
-            )
-
     # ── Snapshot values ────────────────────────────────────────────────────
     _tu   = int(_totals.get("Total Units", 0))
     _curr = int(_totals.get("Current", 0))
@@ -3113,12 +3102,35 @@ if st.session_state.page == "All Hands":
     _wo_month_label = _month_lbl
     _df_wo_month = pd.DataFrame()
     _open_wo_prop = pd.DataFrame()
-    # Work Orders are loaded from the latest full work-order snapshot because
-    # that dataset contains historical Created At dates. Then filter by the
-    # selected calendar month. This works even when no work_orders snapshot was
-    # saved during the selected month.
-    _ah_wo_source = df_wo_f.copy() if df_wo_f is not None else _ah_wo_all.copy()
+    # For the current month, Open WOs must represent the complete current
+    # backlog, including work orders created in prior months. For a historical
+    # month, use the latest snapshot saved inside that month when available.
+    _ah_wo_source = (
+        df_wo_f.copy()
+        if _ah_is_current_month and df_wo_f is not None
+        else _ah_wo_all.copy() if len(_ah_wo_all)
+        else df_wo_f.copy() if df_wo_f is not None
+        else pd.DataFrame()
+    )
     if len(_ah_wo_source) and "Status" in _ah_wo_source.columns:
+        _wo_status_all = (
+            _ah_wo_source["Status"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        # AppFolio Open WO definition requested for All Hands. Use an exact
+        # allow-list so Canceled, every Completed variant, blanks, and any
+        # unexpected status are excluded from the operational backlog.
+        _wo_open_statuses = {"assigned", "estimated", "new", "scheduled", "work done"}
+        _wo_open_all_mask = _wo_status_all.isin(_wo_open_statuses)
+        _open_wo_prop = _ah_wo_source[_wo_open_all_mask].copy()
+        _wo_open = len(_open_wo_prop)
+
+        # Monthly volume/completion KPIs remain tied to WOs created in the
+        # selected calendar month; only the Open KPI/chart uses the full backlog.
         _df_wo_month = _ah_wo_source.copy()
         if "Created At" in _df_wo_month.columns:
             _wo_created = pd.to_datetime(_df_wo_month["Created At"], errors="coerce")
@@ -3129,14 +3141,9 @@ if st.session_state.page == "All Hands":
         _wo_status = _df_wo_month["Status"].astype(str).str.strip().str.lower()
         _wo_completed_mask = _wo_status.str.contains("completed", na=False)
 
-        # All Hands definition: OPEN = every status except Completed /
-        # Completed No Need To Bill (and any other status containing "completed").
-        _wo_open_mask = ~_wo_completed_mask
-        _wo_open = int(_wo_open_mask.sum())
         _wo_completed = int(_wo_completed_mask.sum())
         _wo_total = len(_df_wo_month)
         _wo_comp_pct = (_wo_completed / _wo_total * 100) if _wo_total > 0 else 0.0
-        _open_wo_prop = _df_wo_month[_wo_open_mask].copy()
 
     # ── Monthly leasing — query the selected calendar month directly.
     # monthly_leasing / fallback logic is month-specific and avoids using a
@@ -3147,13 +3154,29 @@ if st.session_state.page == "All Hands":
     _leased = int(_monthly.get("leases_signed", 0) or 0)
     _inq = int(_monthly.get("inquiries", 0) or 0)
 
-    # If the selected month has a property-level funnel snapshot, use it only
-    # when a Portfolio/Property filter is active, so filtered views remain scoped.
-    if SEL and len(_ah_funnel):
+    # The latest Leasing Funnel snapshot inside the selected month contains the
+    # authoritative MTD values. Use it for both All Portfolios and filtered
+    # Portfolio/Property views; the global filter was already applied above.
+    if len(_ah_funnel):
         _inq = int(pd.to_numeric(_ah_funnel.get("Inquiries", 0), errors="coerce").fillna(0).sum()) if "Inquiries" in _ah_funnel.columns else 0
         _shows = int(pd.to_numeric(_ah_funnel.get("Completed Showings", 0), errors="coerce").fillna(0).sum()) if "Completed Showings" in _ah_funnel.columns else 0
         _apps_count = int(pd.to_numeric(_ah_funnel.get("Rental Apps", 0), errors="coerce").fillna(0).sum()) if "Rental Apps" in _ah_funnel.columns else 0
-        _leased = int(pd.to_numeric(_ah_funnel.get("Signed Leases", 0), errors="coerce").fillna(0).sum()) if "Signed Leases" in _ah_funnel.columns else 0
+
+    # Signed Leases must come from Lease History using Countersigned Date and
+    # completed status, matching the Leasing page definition.
+    if df_lease_history_f is not None and len(df_lease_history_f) and "Countersigned Date" in df_lease_history_f.columns:
+        _ah_lh = df_lease_history_f.copy()
+        _ah_lh_date = pd.to_datetime(_ah_lh["Countersigned Date"], errors="coerce")
+        _ah_lh_completed = (
+            _ah_lh["Status"].astype(str).str.strip().str.lower().eq("completed")
+            if "Status" in _ah_lh.columns
+            else pd.Series(True, index=_ah_lh.index)
+        )
+        _leased = int((
+            _ah_lh_completed
+            & (_ah_lh_date.dt.year == _ah_year)
+            & (_ah_lh_date.dt.month == _ah_month)
+        ).sum())
     # ── Alertas automáticas vs. snapshot anterior ─────────────────────────
     if _ah_hist_month is not None and len(_ah_hist_month) >= 2:
         _prev_snap = _ah_hist_month.iloc[-2]
@@ -3416,7 +3439,7 @@ if st.session_state.page == "All Hands":
 <div class="grid">
   <div class="card"><div class="card-label">Total</div><div class="card-val">{_wo_total:,}</div></div>
   <div class="card"><div class="card-label">Completed</div><div class="card-val">{_wo_completed:,}</div><div class="card-sub">{_wo_comp_pct:.0f}% completion</div></div>
-  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">All statuses except Completed · selected month</div></div>
+  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">Assigned · Estimated · New · Scheduled · Work Done</div></div>
 </div>
 
 <h2>Communications — Calls</h2>
@@ -3818,14 +3841,14 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                 st.plotly_chart(fig_coll, width="stretch")
 
     with _col_wo:
-        if len(_ah_wo_all) and (_wo_total > 0 or _wo_open > 0):
+        if len(_ah_wo_source) and (_wo_total > 0 or _wo_open > 0):
             section(f"Work Orders · {_wo_month_label}")
             wo1, wo2 = st.columns(2)
             with wo1: st.markdown(kpi("Total", f"{_wo_total:,}",
                                        sub=f"{_wo_comp_pct:.0f}% completed"), unsafe_allow_html=True)
             with wo2: st.markdown(kpi("Open", f"{_wo_open:,}",
                                        status="bad" if _wo_open > 30 else "warn" if _wo_open > 15 else "good",
-                                       sub="All statuses except Completed · selected month"), unsafe_allow_html=True)
+                                       sub="Assigned · Estimated · New · Scheduled · Work Done"), unsafe_allow_html=True)
             wo3, wo4 = st.columns(2)
             with wo3: st.markdown(kpi("Completed", f"{_wo_completed:,}",
                                        status="good" if _wo_comp_pct >= 70 else "warn" if _wo_comp_pct >= 50 else "bad",
@@ -3839,7 +3862,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                 st.markdown(kpi("Avg Resolve", f"{_wo_avg_res:.1f}d",
                                  status=_tl(_wo_avg_res, THR["wo_resolution_days"], "lower"),
                                  sub=f"Target ≤ {THR['wo_resolution_days']}d"), unsafe_allow_html=True)
-            # Open WOs by property chart — selected month, every non-completed status.
+            # Open WOs by property chart — full backlog, exact AppFolio open statuses.
             if len(_open_wo_prop) > 0 and "Property" in _open_wo_prop.columns:
                 _owp = (
                     _open_wo_prop.groupby("Property").size()

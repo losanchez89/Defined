@@ -41,6 +41,8 @@ REPORT_FILE_MAPPING = {
     "leasing funnel performance": "leasing_funnel_performance.csv",
     "renewal summary": "renewal_summary.csv",
     "rental applications": "rental_applications.csv",
+    "lease history": "lease_history.csv",
+    "lease history non-revenue units": "lease_history_non_revenue.csv",
     "scheduled reports from ringcentral": "Users_Dashboard.xlsx",
 }
 

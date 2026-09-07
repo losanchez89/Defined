@@ -7,6 +7,11 @@ import os
 import glob
 from etl.upload_daily_calls_summary import upload_daily_calls_summary
 from etl.upload_daily_calls_users import upload_daily_calls_users
+from etl.upload_vacancy_detail_non_revenue import (
+    upload_vacancy_detail_non_revenue,
+)
+from etl.upload_lease_history import upload_lease_history
+from etl.upload_lease_history_non_revenue import upload_lease_history_non_revenue
 
 
 DATA_DIR = Path("data/raw")
@@ -621,7 +626,16 @@ def upload_leasing_summary():
 #=================================================
 
 def upload_vacancy_detail():
-    fp = find_latest("unit_vacancy_detail")
+
+    # Vacancy Detail normal — excluir Non-Revenue
+    candidates = [
+        f
+        for f in glob.glob("data/raw/unit_vacancy_detail*.csv")
+        if "non_revenue" not in os.path.basename(f).lower()
+    ]
+
+    fp = max(candidates, key=os.path.getmtime) if candidates else None
+
     if not fp:
         print("No vacancy_detail file found")
         return
@@ -1128,8 +1142,17 @@ if __name__ == "__main__":
     print("\n========== LEASING SUMMARY ==========")
     upload_leasing_summary()
 
+    print("\n========== LEASE HISTORY ==========")
+    upload_lease_history()
+
+    print("\n========== LEASE HISTORY NON-REVENUE ==========")
+    upload_lease_history_non_revenue()
+
     print("\n========== VACANCY DETAIL ==========")
     upload_vacancy_detail()
+
+    print("\n========== VACANCY DETAIL NON-REVENUE ==========")
+    upload_vacancy_detail_non_revenue()
 
     print("\n========== RENEWALS ==========")
     upload_renewal_summary()

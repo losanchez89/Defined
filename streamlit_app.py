@@ -1112,25 +1112,33 @@ def _available_snapshot_months(table: str, limit: int = 1000) -> list[pd.Period]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _latest_snapshot_in_month(table: str, year: int, month: int) -> str | None:
+def _latest_snapshot_in_month(table: str, year: int, month: int, max_attempts: int = 4) -> str | None:
     """Latest snapshot_date inside the selected calendar month."""
     import calendar as _cal
     start = f"{year}-{month:02d}-01"
     end = f"{year}-{month:02d}-{_cal.monthrange(year, month)[1]:02d}"
-    try:
-        res = (
-            supabase.table(table)
-            .select("snapshot_date")
-            .gte("snapshot_date", start)
-            .lte("snapshot_date", end)
-            .order("snapshot_date", desc=True)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0]["snapshot_date"] if res.data else None
-    except Exception as e:
-        log.warning("snapshot for %s %04d-%02d failed: %s", table, year, month, e)
-        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = (
+                supabase.table(table)
+                .select("snapshot_date")
+                .gte("snapshot_date", start)
+                .lte("snapshot_date", end)
+                .order("snapshot_date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return res.data[0]["snapshot_date"] if res.data else None
+        except Exception as exc:
+            if attempt >= max_attempts:
+                log.warning("snapshot for %s %04d-%02d failed after retries: %s", table, year, month, exc)
+                return None
+            delay = min(2 ** (attempt - 1), 4)
+            log.warning(
+                "monthly snapshot retry: table=%s month=%04d-%02d attempt=%s/%s in %ss: %s",
+                table, year, month, attempt, max_attempts, delay, exc,
+            )
+            time.sleep(delay)
 
 
 def _normalize_ah_rent_roll(rows: list) -> pd.DataFrame:
@@ -2425,13 +2433,9 @@ def _calls_data():
     try:
         snap = _latest_snapshot("calls")
         if snap:
-            res = supabase.table("calls")\
-                .select("*")\
-                .eq("snapshot_date", snap)\
-                .limit(500)\
-                .execute()
-            if res.data:
-                df = pd.DataFrame(res.data)
+            rows = _fetch_all("calls", snap)
+            if rows:
+                df = pd.DataFrame(rows)
                 df = df.rename(columns={
                     "name":           "Name",
                     "ext":            "Ext",
@@ -3158,9 +3162,12 @@ if st.session_state.page == "All Hands":
     if _ah_calls is not None:
         df_calls = _ah_calls
         calls_meta = _ah_calls_meta
-    else:
+    elif not _ah_is_current_month:
+        # Do not show the latest call report under a historical month.
         df_calls = None
         calls_meta = None
+    # For Current Month, retain the globally loaded calls report as a fallback
+    # if the month-specific request was temporarily interrupted.
 
     # Lease-expiration KPIs must also be anchored to the selected month snapshot,
     # not to today's date/latest Rent Roll.
@@ -3357,6 +3364,16 @@ if st.session_state.page == "All Hands":
         _calls_missed_pct = 0.0
         _calls_period_text = "Latest available period"
         _agents_rows_html = ""
+        _inbound_rows_html = (
+            '<tr><td colspan="2" class="empty">'
+            'No inbound call data available.'
+            '</td></tr>'
+        )
+        _outbound_rows_html = (
+            '<tr><td colspan="2" class="empty">'
+            'No outbound call data available.'
+            '</td></tr>'
+        )
 
         if df_calls is not None and len(df_calls) > 0:
             _calls_tbl = df_calls.copy()

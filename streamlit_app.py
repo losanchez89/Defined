@@ -11,6 +11,7 @@ import html
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -1024,27 +1025,59 @@ VALID_STATUSES = {
     "Notice-Unrented", "Notice-Rented", "Evict", "Past Resident",
 }
 
-def _latest_snapshot(table: str) -> str | None:
-    """Devuelve la snapshot_date más reciente disponible en la tabla dada."""
-    res = supabase.table(table)\
-        .select("snapshot_date")\
-        .order("snapshot_date", desc=True)\
-        .limit(1)\
-        .execute()
-    return res.data[0]["snapshot_date"] if res.data else None
+def _latest_snapshot(table: str, max_attempts: int = 4) -> str | None:
+    """Return the latest snapshot without letting a transient outage crash the app."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = supabase.table(table)\
+                .select("snapshot_date")\
+                .order("snapshot_date", desc=True)\
+                .limit(1)\
+                .execute()
+            return res.data[0]["snapshot_date"] if res.data else None
+        except Exception as exc:
+            if attempt >= max_attempts:
+                log.error("Latest snapshot failed for %s after %s attempts: %s", table, max_attempts, exc)
+                return None
+            delay = min(2 ** (attempt - 1), 4)
+            log.warning(
+                "Latest snapshot retry: table=%s attempt=%s/%s in %ss: %s",
+                table, attempt, max_attempts, delay, exc,
+            )
+            time.sleep(delay)
 
 
-def _fetch_all(table: str, snap: str, page_size: int = 1000) -> list:
-    """Fetches all rows for a snapshot using pagination (bypasses server 1000-row cap)."""
+def _fetch_all(table: str, snap: str, page_size: int = 1000, max_attempts: int = 4) -> list:
+    """Fetch all snapshot rows with pagination and transient-network retries."""
     rows, start = [], 0
     while True:
-        res = supabase.table(table)\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .range(start, start + page_size - 1)\
-            .execute()
-        rows.extend(res.data)
-        if len(res.data) < page_size:
+        page = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                res = supabase.table(table)\
+                    .select("*")\
+                    .eq("snapshot_date", snap)\
+                    .range(start, start + page_size - 1)\
+                    .execute()
+                page = res.data or []
+                break
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    log.error(
+                        "Supabase fetch failed after %s attempts: table=%s snapshot=%s offset=%s: %s",
+                        max_attempts, table, snap, start, exc,
+                    )
+                    raise
+                delay = min(2 ** (attempt - 1), 4)
+                log.warning(
+                    "Transient Supabase fetch failure: table=%s snapshot=%s offset=%s "
+                    "attempt=%s/%s; retrying in %ss: %s",
+                    table, snap, start, attempt, max_attempts, delay, exc,
+                )
+                time.sleep(delay)
+
+        rows.extend(page)
+        if len(page) < page_size:
             break
         start += page_size
     return rows
@@ -3067,10 +3100,21 @@ if st.session_state.page == "All Hands":
     _ah_wo_snap = _latest_snapshot_in_month("work_orders", _ah_year, _ah_month)
     _ah_calls_snap = _latest_snapshot_in_month("calls", _ah_year, _ah_month)
 
-    _ah_rr_all = _normalize_ah_rent_roll(_fetch_all("rent_roll", _ah_rr_snap)) if _ah_rr_snap else pd.DataFrame()
-    _ah_funnel = _normalize_ah_funnel(_fetch_all("leasing_funnel", _ah_fun_snap)) if _ah_fun_snap else pd.DataFrame()
-    _ah_wo_all = _normalize_ah_work_orders(_fetch_all("work_orders", _ah_wo_snap)) if _ah_wo_snap else pd.DataFrame()
-    _ah_calls, _ah_calls_meta = _normalize_ah_calls(_fetch_all("calls", _ah_calls_snap)) if _ah_calls_snap else (None, None)
+    def _ah_fetch_snapshot(table, snapshot):
+        if not snapshot:
+            return []
+        try:
+            return _fetch_all(table, snapshot)
+        except Exception as exc:
+            # A temporary Supabase/network failure should not crash the entire
+            # dashboard. The month loader can still use its historical fallback.
+            log.error("All Hands could not load %s snapshot %s: %s", table, snapshot, exc)
+            return []
+
+    _ah_rr_all = _normalize_ah_rent_roll(_ah_fetch_snapshot("rent_roll", _ah_rr_snap))
+    _ah_funnel = _normalize_ah_funnel(_ah_fetch_snapshot("leasing_funnel", _ah_fun_snap))
+    _ah_wo_all = _normalize_ah_work_orders(_ah_fetch_snapshot("work_orders", _ah_wo_snap))
+    _ah_calls, _ah_calls_meta = _normalize_ah_calls(_ah_fetch_snapshot("calls", _ah_calls_snap))
 
     # Apply the global Portfolio / Property filter to the selected-month snapshots.
     _ah_rr_all = _f(_ah_rr_all) if len(_ah_rr_all) else _ah_rr_all

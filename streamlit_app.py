@@ -1289,14 +1289,10 @@ def _funnel():
         snap = _latest_snapshot("leasing_funnel")
         if not snap:
             return None
-        res = supabase.table("leasing_funnel")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("leasing_funnel", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":           "Property",
             "inquiries":          "Inquiries",
@@ -1437,14 +1433,10 @@ def _showings_agg():
         snap = _latest_snapshot("showings_agg")
         if not snap:
             return _empty
-        res = supabase.table("showings_agg")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("showings_agg", snap)
+        if not rows:
             return _empty
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":       "Property",
             "calc_completed": "Calc_Completed",
@@ -1478,14 +1470,10 @@ def _vacancy_detail():
         snap = _latest_snapshot("vacancy_detail")
         if not snap:
             return None
-        res = supabase.table("vacancy_detail")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("vacancy_detail", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":       "Property",
             "unit":           "Unit",
@@ -1520,18 +1508,10 @@ def _vacancy_detail_non_revenue():
         if not snap:
             return None
 
-        res = (
-            supabase.table("vacancy_detail_non_revenue")
-            .select("*")
-            .eq("snapshot_date", snap)
-            .limit(10000)
-            .execute()
-        )
-
-        if not res.data:
+        rows = _fetch_all("vacancy_detail_non_revenue", snap)
+        if not rows:
             return None
-
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
 
         df = df.rename(columns={
             "property":       "Property",
@@ -1747,25 +1727,7 @@ def _work_orders():
         snap = _latest_snapshot("work_orders")
         if not snap:
             return None
-        # Paginate — Supabase PostgREST caps at max_rows per request
-        all_rows = []
-        _batch   = 1000
-        _offset  = 0
-        while True:
-            res = (
-                supabase.table("work_orders")
-                .select("*")
-                .eq("snapshot_date", snap)
-                .order("id", desc=False)
-                .range(_offset, _offset + _batch - 1)
-                .execute()
-            )
-            if not res.data:
-                break
-            all_rows.extend(res.data)
-            if len(res.data) < _batch:
-                break
-            _offset += _batch
+        all_rows = _fetch_all("work_orders", snap)
         if not all_rows:
             return None
         df = pd.DataFrame(all_rows)
@@ -1816,14 +1778,10 @@ def _showings_raw():
         snap = _latest_snapshot("showings")
         if not snap:
             return None
-        res = supabase.table("showings")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("showings", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":      "Property",
             "status":        "Status",
@@ -2139,14 +2097,10 @@ def _tickler():
         snap = _latest_snapshot("tenant_tickler")
         if not snap:
             return None
-        res = supabase.table("tenant_tickler")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("tenant_tickler", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":   "Property",
             "event_date": "Date",
@@ -2171,14 +2125,10 @@ def _renewals():
         snap = _latest_snapshot("renewal_summary")
         if not snap:
             return None
-        res = supabase.table("renewal_summary")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("renewal_summary", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":           "Property",
             "unit_id":            "Unit ID",
@@ -2204,14 +2154,10 @@ def _applications():
         snap = _latest_snapshot("rental_applications")
         if not snap:
             return None
-        res = supabase.table("rental_applications")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("rental_applications", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":     "Property",
             "applicant":    "Applicant",
@@ -2235,14 +2181,10 @@ def _leads():
         snap = _latest_snapshot("leads")
         if not snap:
             return None
-        res = supabase.table("leads")\
-            .select("*")\
-            .eq("snapshot_date", snap)\
-            .limit(10000)\
-            .execute()
-        if not res.data:
+        rows = _fetch_all("leads", snap)
+        if not rows:
             return None
-        df = pd.DataFrame(res.data)
+        df = pd.DataFrame(rows)
         df = df.rename(columns={
             "property":         "Property",
             "name":             "Name",
@@ -2291,15 +2233,31 @@ def _historical():
         return None
 
 @st.cache_data(ttl=300)
-def load_historical_metrics():
-    res = (
-        supabase.table("historical_metrics")
-        .select("*")
-        .order("date")
-        .execute()
-    )
+def load_historical_metrics(max_attempts: int = 4):
+    """Load historical metrics without allowing a transient HTTP/2 disconnect to crash Streamlit."""
+    rows = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = (
+                supabase.table("historical_metrics")
+                .select("*")
+                .order("date")
+                .execute()
+            )
+            rows = res.data or []
+            break
+        except Exception as exc:
+            if attempt >= max_attempts:
+                log.error("historical_metrics failed after %s attempts: %s", max_attempts, exc)
+                return pd.DataFrame()
+            delay = min(2 ** (attempt - 1), 4)
+            log.warning(
+                "historical_metrics retry %s/%s in %ss: %s",
+                attempt, max_attempts, delay, exc,
+            )
+            time.sleep(delay)
 
-    df = pd.DataFrame(res.data)
+    df = pd.DataFrame(rows)
 
     if df.empty:
         return df
@@ -2325,18 +2283,35 @@ def load_historical_metrics():
 
     return df
 
-def save_portfolio_history_snapshot(row: dict):
+def save_portfolio_history_snapshot(row: dict, max_attempts: int = 3):
     """
     Guarda o actualiza el snapshot histórico del portfolio.
     Si ya existe snapshot_date, lo actualiza.
     """
-    try:
-        supabase.table("portfolio_history").upsert(
-            row,
-            on_conflict="snapshot_date"
-        ).execute()
-    except Exception as e:
-        st.warning(f"Could not save portfolio history snapshot: {e}")
+    snapshot_key = str(row.get("snapshot_date", ""))
+    if st.session_state.get("_portfolio_history_saved") == snapshot_key:
+        return True
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            supabase.table("portfolio_history").upsert(
+                row,
+                on_conflict="snapshot_date"
+            ).execute()
+            st.session_state["_portfolio_history_saved"] = snapshot_key
+            return True
+        except Exception as exc:
+            if attempt >= max_attempts:
+                # Portfolio history is supplemental. Log the failure without
+                # interrupting or displaying a warning across every dashboard page.
+                log.warning("portfolio history snapshot save failed: %s", exc)
+                return False
+            delay = min(2 ** (attempt - 1), 4)
+            log.warning(
+                "portfolio history save retry %s/%s in %ss: %s",
+                attempt, max_attempts, delay, exc,
+            )
+            time.sleep(delay)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -4780,7 +4755,7 @@ elif st.session_state.page == "Vacancy":
         df_vac_base = df_vac_non_revenue_f.copy()
     else:
         if df_vac_f is None:
-            st.warning("unit_vacancy_detail.csv not found.")
+            st.warning("Vacancy Detail data is temporarily unavailable. Please refresh in a moment.")
             st.stop()
         df_vac_base = df_vac_f.copy()
 

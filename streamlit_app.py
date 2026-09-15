@@ -1159,6 +1159,46 @@ def _normalize_ah_rent_roll(rows: list) -> pd.DataFrame:
     return filter_future_properties(df)
 
 
+def _all_hands_property_display_name(value) -> str:
+    """Expand abbreviated AppFolio property labels used in All Hands."""
+    name = clean_property_name(value)
+    key = re.sub(r"\s+", " ", str(name).strip()).casefold()
+    aliases = {
+        "16901": "16901-16915 Napa St",
+        "16901 napa st": "16901-16915 Napa St",
+        "4511": "4511-4517 Prospect Ave",
+        "4511 prospect ave": "4511-4517 Prospect Ave",
+    }
+    return aliases.get(key, name)
+
+
+def _normalize_ah_delinquency(rows: list) -> pd.DataFrame:
+    """Return property-level delinquency rows for an All Hands snapshot."""
+    if not rows:
+        return pd.DataFrame(columns=["Property", "Amount Receivable"])
+    df = pd.DataFrame(rows).rename(columns={
+        "property": "Property",
+        "amount_receivable": "Amount Receivable",
+        "name": "Name",
+    })
+    if "Property" not in df.columns or "Amount Receivable" not in df.columns:
+        return pd.DataFrame(columns=["Property", "Amount Receivable"])
+    df["Property"] = (
+        df["Property"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .apply(_all_hands_property_display_name)
+    )
+    if "Name" in df.columns:
+        _name = df["Name"].fillna("").astype(str).str.strip()
+        df = df[~_name.str.fullmatch(r"(?i)total|totals?", na=False)].copy()
+    df = df[df["Property"].ne("")].copy()
+    df["Amount Receivable"] = clean_money_column(df["Amount Receivable"])
+    df = df[df["Amount Receivable"] > 0].copy()
+    return filter_future_properties(df[["Property", "Amount Receivable"]]).reset_index(drop=True)
+
+
 def _normalize_ah_funnel(rows: list) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
@@ -3093,6 +3133,11 @@ if st.session_state.page == "All Hands":
     _ah_fun_snap = _latest_snapshot_in_month("leasing_funnel", _ah_year, _ah_month)
     _ah_wo_snap = _latest_snapshot_in_month("work_orders", _ah_year, _ah_month)
     _ah_calls_snap = _latest_snapshot_in_month("calls", _ah_year, _ah_month)
+    _ah_delinq_snap = _latest_snapshot_in_month("delinquency", _ah_year, _ah_month)
+    _ah_prev_period = _ah_selected_period - 1
+    _ah_delinq_prev_snap = _latest_snapshot_in_month(
+        "delinquency", int(_ah_prev_period.year), int(_ah_prev_period.month)
+    )
 
     def _ah_fetch_snapshot(table, snapshot):
         if not snapshot:
@@ -3109,11 +3154,25 @@ if st.session_state.page == "All Hands":
     _ah_funnel = _normalize_ah_funnel(_ah_fetch_snapshot("leasing_funnel", _ah_fun_snap))
     _ah_wo_all = _normalize_ah_work_orders(_ah_fetch_snapshot("work_orders", _ah_wo_snap))
     _ah_calls, _ah_calls_meta = _normalize_ah_calls(_ah_fetch_snapshot("calls", _ah_calls_snap))
+    _ah_delinq = _normalize_ah_delinquency(_ah_fetch_snapshot("delinquency", _ah_delinq_snap))
+    _ah_delinq_prev = _normalize_ah_delinquency(
+        _ah_fetch_snapshot("delinquency", _ah_delinq_prev_snap)
+    )
 
     # Apply the global Portfolio / Property filter to the selected-month snapshots.
     _ah_rr_all = _f(_ah_rr_all) if len(_ah_rr_all) else _ah_rr_all
     _ah_funnel = _f(_ah_funnel) if len(_ah_funnel) else _ah_funnel
     _ah_wo_all = _f(_ah_wo_all) if len(_ah_wo_all) else _ah_wo_all
+    if SEL:
+        _ah_sel_delinq_keys = {_norm_key(clean_property_name(p)) for p in SEL}
+        if len(_ah_delinq):
+            _ah_delinq = _ah_delinq[
+                _ah_delinq["Property"].map(_norm_key).isin(_ah_sel_delinq_keys)
+            ].copy()
+        if len(_ah_delinq_prev):
+            _ah_delinq_prev = _ah_delinq_prev[
+                _ah_delinq_prev["Property"].map(_norm_key).isin(_ah_sel_delinq_keys)
+            ].copy()
 
     # Use selected-month data throughout All Hands. Prefer a full Rent Roll
     # snapshot; otherwise fall back to the latest historical_metrics row in
@@ -3203,6 +3262,28 @@ if st.session_state.page == "All Hands":
 
     # ── Snapshot values ────────────────────────────────────────────────────
     _tu   = int(_totals.get("Total Units", 0))
+    _ah_property_count = 0
+    if len(_ah_rr_all) and "Property" in _ah_rr_all.columns:
+        _ah_property_names = _ah_rr_all["Property"].fillna("").astype(str).str.strip()
+        _ah_property_count = int(
+            _ah_property_names[
+                _ah_property_names.ne("")
+                & ~_ah_property_names.str.lower().isin({"nan", "none"})
+            ].nunique()
+        )
+    elif df_metrics_f is not None and len(df_metrics_f) and "Property" in df_metrics_f.columns:
+        _ah_property_names = df_metrics_f["Property"].fillna("").astype(str).str.strip()
+        _ah_property_count = int(
+            _ah_property_names[
+                _ah_property_names.ne("")
+                & ~_ah_property_names.str.lower().isin({"nan", "none"})
+            ].nunique()
+        )
+    _ah_properties_sub = (
+        f"{_ah_property_count:,} {'property' if _ah_property_count == 1 else 'properties'}"
+        if _ah_property_count
+        else "Property count unavailable"
+    )
     _curr = int(_totals.get("Current", 0))
     _vu   = int(_totals.get("Vacant-Unrented", 0))
     _vr   = int(_totals.get("Vacant-Rented", 0))
@@ -3480,14 +3561,33 @@ if st.session_state.page == "All Hands":
         # ── Top delinquent properties ─────────────────────────────────────────
         _delinq_rows_html = ""
 
-        if df_delinq_f is not None and len(df_delinq_f) > 0:
-            _delinq_tbl = df_delinq_f.copy()
+        # Use the selected month's snapshot. For the current month only, retain
+        # the already-loaded report as a fallback after a temporary fetch error.
+        _delinq_source = _ah_delinq.copy()
+        if (
+            _delinq_source.empty
+            and _ah_is_current_month
+            and df_delinq_f is not None
+            and len(df_delinq_f) > 0
+        ):
+            _delinq_source = df_delinq_f.copy()
+
+        if len(_delinq_source) > 0:
+            _delinq_tbl = _delinq_source.copy()
 
             if "Amount Receivable" not in _delinq_tbl.columns:
                 _delinq_tbl["Amount Receivable"] = 0
 
             if "Property" not in _delinq_tbl.columns:
                 _delinq_tbl["Property"] = ""
+
+            _delinq_tbl["Property"] = (
+                _delinq_tbl["Property"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .apply(_all_hands_property_display_name)
+            )
 
             _delinq_tbl["Amount Receivable"] = pd.to_numeric(
                 _delinq_tbl["Amount Receivable"],
@@ -3503,10 +3603,46 @@ if st.session_state.page == "All Hands":
                 .head(5)
             )
 
+            _prev_by_property = {}
+            if len(_ah_delinq_prev):
+                _prev_tbl = (
+                    _ah_delinq_prev
+                    .groupby("Property", dropna=False)["Amount Receivable"]
+                    .sum()
+                    .reset_index()
+                )
+                _prev_by_property = {
+                    _norm_key(str(r.get("Property", ""))): float(r.get("Amount Receivable", 0) or 0)
+                    for _, r in _prev_tbl.iterrows()
+                }
+
+            def _delinq_comparison_html(property_name, current_balance):
+                if not _ah_delinq_prev_snap:
+                    return '<td class="muted">N/A</td><td class="muted">N/A</td>'
+                previous_balance = float(
+                    _prev_by_property.get(_norm_key(str(property_name)), 0.0)
+                )
+                change = float(current_balance) - previous_balance
+                if previous_balance > 0:
+                    change_pct = change / previous_balance * 100
+                    pct_text = f" ({change_pct:+.1f}%)"
+                elif current_balance > 0:
+                    pct_text = " (New)"
+                else:
+                    pct_text = " (0.0%)"
+                if change < -0.005:
+                    change_html = f'<span class="change-down">▼ ${abs(change):,.0f}{pct_text}</span>'
+                elif change > 0.005:
+                    change_html = f'<span class="change-up">▲ ${abs(change):,.0f}{pct_text}</span>'
+                else:
+                    change_html = '<span class="change-flat">— $0 (0.0%)</span>'
+                return f"<td>${previous_balance:,.0f}</td><td>{change_html}</td>"
+
             _delinq_rows_html = "".join(
                 "<tr>"
                 f"<td>{html.escape(str(r.get('Property', '')))}</td>"
                 f"<td>${float(r.get('Amount Receivable', 0) or 0):,.0f}</td>"
+                f"{_delinq_comparison_html(r.get('Property', ''), float(r.get('Amount Receivable', 0) or 0))}"
                 "</tr>"
                 for _, r in _delinq_tbl.iterrows()
             )
@@ -3514,7 +3650,7 @@ if st.session_state.page == "All Hands":
             
         if not _delinq_rows_html:
             _delinq_rows_html = (
-                '<tr><td colspan="2" class="empty">'
+                '<tr><td colspan="4" class="empty">'
                 'No delinquency data available.'
                 '</td></tr>'
             )
@@ -3548,6 +3684,10 @@ if st.session_state.page == "All Hands":
   td{{padding:8px 10px;border-top:1px solid #E2E8F0;color:#334155;}}
   td:nth-last-child(-n+2){{white-space:nowrap;}}
   .empty{{text-align:center;color:#94A3B8;padding:16px;}}
+  .muted{{color:#94A3B8;}}
+  .change-down{{color:#059669;font-weight:700;}}
+  .change-up{{color:#DC2626;font-weight:700;}}
+  .change-flat{{color:#64748B;font-weight:700;}}
   @media print{{body{{padding:16px 20px;}}@page{{margin:1cm;}}}}
 </style>
 </head>
@@ -3557,9 +3697,9 @@ if st.session_state.page == "All Hands":
 
 <h2>Occupancy</h2>
 <div class="grid">
-  <div class="card"><div class="card-label">Total Units</div><div class="card-val">{_tu:,}</div></div>
+  <div class="card"><div class="card-label">Total Units</div><div class="card-val">{_tu:,}</div><div class="card-sub">{_ah_properties_sub}</div></div>
   <div class="card"><div class="card-label">Physical Occ</div><div class="card-val">{_phys_occ:.1f}%</div><div class="card-sub">Target {THR['physical_occ']}%</div></div>
-  <div class="card"><div class="card-label">Economic Occ</div><div class="card-val">{_econ_occ:.1f}%</div></div>
+  <div class="card"><div class="card-label">Economic Occ</div><div class="card-val">{_econ_occ:.1f}%</div><div class="card-sub">Target {THR['economic_occ']}%</div></div>
   <div class="card"><div class="card-label">Collection Rate</div><div class="card-val">{_pct_coll:.1f}%</div><div class="card-sub">Target {THR['collection_rate']}%</div></div>
 </div>
 
@@ -3639,12 +3779,15 @@ if st.session_state.page == "All Hands":
 </div>
 
 <h2>Top 5 Delinquent Properties</h2>
+<div class="section-note">Compared with {_ah_prev_period.to_timestamp().strftime('%B %Y')} · Lower balance is better</div>
 <div class="table-wrap">
 <table>
 <thead>
 <tr>
     <th>Property</th>
-    <th>Balance</th>
+    <th>Current Balance</th>
+    <th>Previous Month</th>
+    <th>Change</th>
 </tr>
 </thead>
 

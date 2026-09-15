@@ -2073,6 +2073,20 @@ def _leasing_funnel_activity_range(start_date, end_date, properties: tuple[str, 
         return empty_totals, empty_weekly
 
 
+def _renewal_mask(df: pd.DataFrame) -> pd.Series:
+    """Return True only for rows explicitly marked as renewals."""
+    if df is None or "Renewal" not in df.columns:
+        return pd.Series(False, index=df.index if df is not None else pd.Index([]), dtype=bool)
+    return (
+        df["Renewal"]
+        .fillna(False)
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin({"yes", "true", "1"})
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _lease_history(table: str = "lease_history"):
     try:
@@ -2087,6 +2101,7 @@ def _lease_history(table: str = "lease_history"):
             "lease_start": "Lease Start", "lease_end": "Lease End", "rent": "Rent",
             "status": "Status", "countersigned_date": "Countersigned Date",
             "occupancy_name": "Occupancy Name",
+            "renewal": "Renewal",
         })
         for col in ["Lease Start", "Lease End", "Countersigned Date"]:
             if col in df.columns:
@@ -3288,8 +3303,10 @@ if st.session_state.page == "All Hands":
             if "Status" in _ah_lh.columns
             else pd.Series(True, index=_ah_lh.index)
         )
+        _ah_lh_new_lease = ~_renewal_mask(_ah_lh)
         _leased = int((
             _ah_lh_completed
+            & _ah_lh_new_lease
             & (_ah_lh_date.dt.year == _ah_year)
             & (_ah_lh_date.dt.month == _ah_month)
         ).sum())
@@ -5023,16 +5040,26 @@ elif st.session_state.page == "Leasing":
 
     _today = pd.Timestamp(now().date())
     _default_start = _today.replace(day=1)
-    _date_col, _nr_col = st.columns([3, 2])
-    with _date_col:
-        _leasing_dates = st.date_input(
-            "Reporting Period",
-            value=(_default_start.date(), _today.date()),
+    _start_col, _end_col, _nr_col = st.columns([2, 2, 2])
+    with _start_col:
+        _leasing_start_date = st.date_input(
+            "Start Date",
+            value=_default_start.date(),
             min_value=date(2020, 1, 1),
             max_value=_today.date(),
             format="MM/DD/YYYY",
-            key="leasing_reporting_period",
-            help="This date range applies to the entire Leasing page.",
+            key="leasing_start_date",
+            help="First day included in Leasing totals.",
+        )
+    with _end_col:
+        _leasing_end_date = st.date_input(
+            "End Date",
+            value=_today.date(),
+            min_value=date(2020, 1, 1),
+            max_value=_today.date(),
+            format="MM/DD/YYYY",
+            key="leasing_end_date",
+            help="Last day included in Leasing totals.",
         )
     with _nr_col:
         _include_nr = st.toggle(
@@ -5041,14 +5068,11 @@ elif st.session_state.page == "Leasing":
             key="leasing_include_non_revenue",
         )
 
-    if not isinstance(_leasing_dates, (tuple, list)) or len(_leasing_dates) != 2:
-        st.info("Select both a start date and an end date.")
-        st.stop()
-
-    _range_start = pd.Timestamp(_leasing_dates[0]).normalize()
-    _range_end = pd.Timestamp(_leasing_dates[1]).normalize()
+    _range_start = pd.Timestamp(_leasing_start_date).normalize()
+    _range_end = pd.Timestamp(_leasing_end_date).normalize()
     if _range_start > _range_end:
-        _range_start, _range_end = _range_end, _range_start
+        st.warning("Start Date must be on or before End Date.")
+        st.stop()
     if _range_start.year == _range_end.year and _range_start.month == _range_end.month:
         _period_lbl = f"{_range_start.strftime('%b')} {_range_start.day}–{_range_end.day}, {_range_end.year}"
     elif _range_start.year == _range_end.year:
@@ -5071,6 +5095,7 @@ elif st.session_state.page == "Leasing":
             _lease_range = _lease_range[
                 _lease_range["Status"].astype(str).str.strip().str.lower().eq("completed")
             ].copy()
+        _lease_range = _lease_range[~_renewal_mask(_lease_range)].copy()
     elif "Countersigned Date" not in _lease_range.columns:
         _lease_range = pd.DataFrame()
 

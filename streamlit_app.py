@@ -4394,67 +4394,145 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             st.plotly_chart(_ca_fig, width="stretch")
 
     # ── Row E: Occupancy trend ────────────────────────────────────────────
-    if df_hist is not None and len(df_hist) >= 15:   
-        section("Occupancy Trend — Last 6 Months")
-        fig_ah = go.Figure()
-
-        df_hist = df_hist.copy()
-
-    # Normalizar columnas por si viene de _historical() o load_historical_metrics()
-        df_hist = df_hist.rename(columns={
+    if df_hist is not None and len(df_hist) >= 2:
+        section("Occupancy Trend — Weekly · Last 6 Months")
+        _occ_hist = df_hist.copy().rename(columns={
             "date": "Date",
             "physical_occupancy": "Physical Occupancy",
             "economic_occupancy": "Economic Occupancy",
         })
-
-        df_hist["snapshot_date"] = pd.to_datetime(df_hist["Date"], errors="coerce")
-        df_hist = df_hist.dropna(subset=["snapshot_date"])
-
-        fig_ah.add_trace(go.Scatter(
-            x=df_hist["snapshot_date"],
-            y=pd.to_numeric(df_hist["Physical Occupancy"], errors="coerce"),
-            name="Physical Occ %",
-            line=dict(color=PC, width=3),
-            mode="lines+markers",
-            marker=dict(size=7),
-            fill="tozeroy",
-            fillcolor="rgba(27,79,216,0.07)",
-        ))
-
-        fig_ah.add_trace(go.Scatter(
-            x=df_hist["snapshot_date"],
-            y=pd.to_numeric(df_hist["Economic Occupancy"], errors="coerce"),
-            name="Economic Occ %",
-            line=dict(color="#059669", width=3),
-            mode="lines+markers",
-            marker=dict(size=7),
-        ))
-
-        fig_ah.add_hline(
-            y=THR["physical_occ"],
-            line_dash="dot",
-            line_color="#DC2626",
-            annotation_text=f"{THR['physical_occ']}% target",
-            annotation_font=dict(size=10),
+        _occ_hist["snapshot_date"] = pd.to_datetime(_occ_hist["Date"], errors="coerce")
+        for _occ_col in ["Physical Occupancy", "Economic Occupancy"]:
+            _occ_hist[_occ_col] = pd.to_numeric(_occ_hist[_occ_col], errors="coerce")
+        _occ_hist = (
+            _occ_hist
+            .dropna(subset=["snapshot_date", "Physical Occupancy", "Economic Occupancy"])
+            .sort_values("snapshot_date")
         )
 
-        fig_ah.update_layout(
-            template="dfm",
-            height=260,
-            yaxis=dict(
-                title="Occupancy %",
-                ticksuffix="%",
-                range=[85, 100],
-                gridcolor="#F1F5F9"
-            ),
-            xaxis=dict(gridcolor="#F1F5F9"),
-            paper_bgcolor="#FFFFFF",
-            plot_bgcolor="#FFFFFF",
-            legend=dict(orientation="h", y=-0.25),
-            margin=dict(l=0, r=0, t=10, b=40),
-        )
+        if len(_occ_hist) >= 2:
+            _occ_latest_date = _occ_hist["snapshot_date"].max().normalize()
+            _occ_start_date = _occ_latest_date - pd.DateOffset(months=6)
+            _occ_hist = _occ_hist[_occ_hist["snapshot_date"] >= _occ_start_date].copy()
 
-        st.plotly_chart(fig_ah, width="stretch")
+            # One end-of-week snapshot keeps the six-month trend readable while
+            # preserving the actual reported value rather than averaging it.
+            _occ_weekly = (
+                _occ_hist
+                .set_index("snapshot_date")[["Physical Occupancy", "Economic Occupancy"]]
+                .resample("W-SUN")
+                .last()
+                .dropna(how="all")
+                .reset_index()
+            )
+
+            fig_ah = go.Figure()
+            _occ_series = [
+                ("Physical Occupancy", PC),
+                ("Economic Occupancy", "#059669"),
+            ]
+            for _occ_name, _occ_color in _occ_series:
+                fig_ah.add_trace(go.Scatter(
+                    x=_occ_weekly["snapshot_date"],
+                    y=_occ_weekly[_occ_name],
+                    name=_occ_name,
+                    mode="lines+markers",
+                    line=dict(color=_occ_color, width=3),
+                    marker=dict(size=6, color="#FFFFFF", line=dict(color=_occ_color, width=2)),
+                    connectgaps=True,
+                    hovertemplate=(
+                        f"<b>{_occ_name}</b><br>"
+                        "%{x|%b %d, %Y}<br>%{y:.2f}%<extra></extra>"
+                    ),
+                ))
+
+            _occ_target = float(THR["physical_occ"])
+            fig_ah.add_hline(
+                y=_occ_target,
+                line_dash="dash",
+                line_width=1.5,
+                line_color="#DC2626",
+            )
+            fig_ah.add_annotation(
+                x=0.995,
+                xref="paper",
+                y=_occ_target,
+                yref="y",
+                text=f"Target {_occ_target:.1f}%",
+                showarrow=False,
+                xanchor="right",
+                yanchor="bottom",
+                font=dict(size=10, color="#DC2626"),
+                bgcolor="rgba(255,255,255,0.85)",
+            )
+
+            # Label the most recent reported values at the right edge.
+            _occ_first_date = _occ_weekly["snapshot_date"].min()
+            _occ_last_date = _occ_weekly["snapshot_date"].max()
+            for _occ_name, _occ_color in _occ_series:
+                _occ_valid = _occ_weekly.dropna(subset=[_occ_name])
+                if len(_occ_valid):
+                    _occ_last = _occ_valid.iloc[-1]
+                    fig_ah.add_annotation(
+                        x=_occ_last["snapshot_date"],
+                        y=float(_occ_last[_occ_name]),
+                        text=f"{float(_occ_last[_occ_name]):.1f}%",
+                        showarrow=False,
+                        xshift=10,
+                        xanchor="left",
+                        font=dict(size=10, color=_occ_color),
+                    )
+
+            _occ_values = pd.concat([
+                _occ_weekly["Physical Occupancy"],
+                _occ_weekly["Economic Occupancy"],
+                pd.Series([_occ_target]),
+            ]).dropna()
+            _occ_y_min = max(85.0, float(_occ_values.min()) - 1.0)
+            _occ_y_max = min(100.0, float(_occ_values.max()) + 1.0)
+            if _occ_y_max - _occ_y_min < 5.0:
+                _occ_mid = (_occ_y_min + _occ_y_max) / 2
+                _occ_y_min = max(85.0, _occ_mid - 2.5)
+                _occ_y_max = min(100.0, _occ_mid + 2.5)
+
+            fig_ah.update_layout(
+                template="dfm",
+                height=320,
+                yaxis=dict(
+                    title="Occupancy %",
+                    ticksuffix="%",
+                    range=[_occ_y_min, _occ_y_max],
+                    gridcolor="#E2E8F0",
+                    zeroline=False,
+                ),
+                xaxis=dict(
+                    title="",
+                    # Start at the first available weekly observation so months
+                    # without historical data do not create a large blank area.
+                    range=[
+                        _occ_first_date - pd.Timedelta(days=5),
+                        _occ_last_date + pd.Timedelta(days=12),
+                    ],
+                    tickformat="%b %d",
+                    dtick="M1",
+                    gridcolor="#F1F5F9",
+                    showgrid=False,
+                ),
+                paper_bgcolor="#FFFFFF",
+                plot_bgcolor="#FFFFFF",
+                hovermode="x unified",
+                legend=dict(
+                    orientation="h",
+                    x=0,
+                    xanchor="left",
+                    y=1.14,
+                    yanchor="top",
+                    font=dict(size=11),
+                ),
+                margin=dict(l=10, r=70, t=48, b=35),
+            )
+
+            st.plotly_chart(fig_ah, width="stretch")
 
 
 # ============================================================================

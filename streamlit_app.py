@@ -665,7 +665,7 @@ def load_config() -> dict:
         "phone_team": [
             "Chonalyn", "Nichole", "Alejandro", "Andrea",
             "Norman", "Inés", "Ines", "Lorena", "Carmen",
-            "Laura", "Sergei"
+            "Laura", "Sergei", "Frank Muller", "Carla Higueras", "Victor Hurtado"
         ],
     }
     p = Path(__file__).parent / "config.yaml"
@@ -679,6 +679,10 @@ def load_config() -> dict:
                 defaults["phone_team"] = v
             elif v is not None:
                 defaults[k] = v
+    # Keep these phone team additions even when config.yaml overrides the list.
+    for name in ("Frank Muller", "Carla Higueras", "Victor Hurtado"):
+        if name.casefold() not in {str(member).strip().casefold() for member in defaults["phone_team"]}:
+            defaults["phone_team"].append(name)
     return defaults
 
 

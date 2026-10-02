@@ -148,6 +148,54 @@ def clean_property_name(name):
     return name.strip()
 
 
+def monthly_rent_collection(rr, aged, period):
+    """Estimate rent satisfied from scheduled rent less this month's rent receivables.
+
+    Aged detail contains open charges only, so Total Amount is NOT total billed.
+    Credits/payments cannot be distinguished; this is not cash receipts.
+    Missing detail must never silently imply 100% collection.
+    """
+    columns = ["Property", "billed", "past_due", "collected", "pct"]
+    empty = pd.DataFrame(columns=columns)
+    if rr is None or aged is None or rr.empty or aged.empty:
+        return float("nan"), float("nan"), float("nan"), float("nan"), empty
+    a = aged.rename(columns={
+        "property": "Property", "charge_date": "Charge Date",
+        "gl_account_name": "GL Account Name", "amount_receivable": "Amount Receivable",
+        "unit_id": "Unit ID", "payer_name": "Payer Name",
+    }).copy()
+    required = {"Property", "Charge Date", "GL Account Name", "Amount Receivable", "Payer Name"}
+    if not required.issubset(a.columns) or not {"Property", "Rent", "Status", "Tenant"}.issubset(rr.columns):
+        return float("nan"), float("nan"), float("nan"), float("nan"), empty
+    r = rr[rr["Status"].eq("Current") & rr["Property"].notna()].copy()
+    use_unit_ids = ("Unit ID" in r.columns and "Unit ID" in a.columns
+                    and r["Unit ID"].notna().all() and a["Unit ID"].notna().any())
+    r["billed"] = clean_money_column(r["Rent"])
+    def identity(frame, name):
+        ids = (pd.to_numeric(frame["Unit ID"], errors="coerce").astype("Int64").astype(str)
+               if use_unit_ids else pd.Series("", index=frame.index))
+        # Name tokens tolerate the export's Last, First vs First Last ordering.
+        names = frame[name].fillna("").astype(str).map(
+            lambda value: " ".join(sorted(re.findall(r"\w+", value.casefold()))))
+        return frame["Property"].fillna("").astype(str).map(clean_property_name).str.casefold().str.strip() + "|" + ids + "|" + names
+    r["_key"] = identity(r, "Tenant")
+    dates = pd.to_datetime(a["Charge Date"], errors="coerce")
+    month = pd.Period(period, freq="M")
+    if not dates.dt.to_period("M").eq(month).any():
+        return float(r["billed"].sum()), float("nan"), float("nan"), float("nan"), empty
+    a = a[dates.dt.to_period("M").eq(month) & a["GL Account Name"].fillna("").astype(str).str.strip().str.casefold().isin(["rental income", "section 8"])].copy()
+    a["_key"] = identity(a, "Payer Name")
+    a["_balance"] = clean_money_column(a["Amount Receivable"])
+    balances = a.groupby("_key")["_balance"].sum()
+    r["past_due"] = r["_key"].map(balances).fillna(0).clip(lower=0)
+    r["collected"] = r["billed"] - r["past_due"]
+    props = r.groupby("Property")[["billed", "past_due", "collected"]].sum().reset_index()
+    props["pct"] = props["collected"].div(props["billed"].where(props["billed"].gt(0))).mul(100).clip(0, 100)
+    billed, outstanding, collected = (float(props[c].sum()) for c in ["billed", "past_due", "collected"])
+    rate = collected / billed * 100 if billed > 0 else float("nan")
+    return billed, outstanding, collected, rate, props
+
+
 def clean_money_column(series):
     """
     Convierte una columna de dinero a float con limpieza agresiva.
@@ -1645,6 +1693,7 @@ def _aged_receivable(include_paid: bool = False):
             "total_amount":      "Total Amount",
             "charge_date":       "Charge Date",
             "posting_date":      "Posting Date",
+            "unit_id":           "Unit ID",
         })
 
         for col in [
@@ -2769,11 +2818,10 @@ with st.spinner("Loading portfolio data…"):
             else 0.0
         )
 
-        collection_rate_hist = (
-            ((monthly_rent_hist - outstanding_hist) / monthly_rent_hist * 100)
-            if monthly_rent_hist > 0
-            else 0.0
-        )
+        _, _, _, collection_rate_hist, _ = monthly_rent_collection(
+            df_rr, df_aged_all, pd.Timestamp(now().date()).to_period("M"))
+        if pd.isna(collection_rate_hist):
+            collection_rate_hist = None
 
         vacant_unrented_hist = int(totals.get("Vacant-Unrented", 0) or 0)
         notice_unrented_hist = int(totals.get("Notice-Unrented", 0) or 0)
@@ -3296,6 +3344,7 @@ if st.session_state.page == "All Hands":
     _ev   = int(_totals.get("Evict", 0))
     _rgap = float(df_metrics_f["Revenue Gap ($)"].sum()) if "Revenue Gap ($)" in df_metrics_f.columns else 0
 
+    _ah_collection_props = pd.DataFrame()
     _sum_rent = _pct_coll = 0.0
     if _ah_historical_only and _ah_hist_row is not None:
         try:
@@ -3306,12 +3355,16 @@ if st.session_state.page == "All Hands":
             _pct_coll = float(_ah_hist_row.get("Collection Rate", 0) or 0)
         except Exception:
             _pct_coll = 0.0
-    elif df_rr_f is not None and "Rent" in df_rr_f.columns:
-        _curr_rr = df_rr_f[df_rr_f["Status"] == "Current"]
-        _sum_rent = float(clean_money_column(_curr_rr["Rent"]).sum())
-        if "Past Due" in _curr_rr.columns and _sum_rent > 0:
-            _pd_s = clean_money_column(_curr_rr["Past Due"]).clip(lower=0)  # credits (negatives) = fully collected
-            _pct_coll = max(0.0, min(100.0, (_sum_rent - float(_pd_s.sum())) / _sum_rent * 100))
+    else:
+        _ah_aged_snap = _latest_snapshot_in_month("aged_receivable", _ah_year, _ah_month)
+        _ah_aged_data = pd.DataFrame(_ah_fetch_snapshot("aged_receivable", _ah_aged_snap))
+        if _ah_aged_data.empty and _ah_is_current_month and df_aged_all is not None:
+            _ah_aged_data = df_aged_all.copy()
+        _ah_aged_data = _ah_aged_data.rename(columns={"property": "Property"})
+        _sum_rent, _ah_outstanding, _ah_collected, _pct_coll, _ah_collection_props = monthly_rent_collection(
+            df_rr_f, _f(_ah_aged_data), _ah_selected_period)
+
+    st.caption("Collection Rate: monthly rent less reporting-month Rental Income and Section 8 balances, for Current residents and selected properties. Balance-based calculation; not a cash-receipts report.")
 
     _wo_open = _wo_total = _wo_completed = 0
     _wo_comp_pct = 0.0
@@ -3720,7 +3773,7 @@ if st.session_state.page == "All Hands":
 <div class="grid">
   <div class="card"><div class="card-label">Total</div><div class="card-val">{_wo_total:,}</div></div>
   <div class="card"><div class="card-label">Completed</div><div class="card-val">{_wo_completed:,}</div><div class="card-sub">{_wo_comp_pct:.0f}% completion</div></div>
-  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">Assigned · Estimated · New · Scheduled · Work Done</div></div>
+  <div class="card"><div class="card-label">Open</div><div class="card-val">{_wo_open:,}</div><div class="card-sub">Assigned · New · Scheduled · Work Done</div></div>
 </div>
 
 <h2>Communications — Calls</h2>
@@ -4053,7 +4106,11 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
             _prop_c2 = _prop_c2.nlargest(5, "past_due").sort_values("past_due", ascending=True)
 
             if len(_prop_c2):
-                _prop_c2["pct"] = ((_prop_c2["billed"] - _prop_c2["past_due"]) / _prop_c2["billed"] * 100).clip(0, 100)
+                # Past-due ranking remains all ages; collection colors use monthly rent balances.
+                if not _ah_collection_props.empty:
+                    _prop_c2["pct"] = _prop_c2["Property"].map(_ah_collection_props.set_index("Property")["pct"])
+                else:
+                    _prop_c2["pct"] = float("nan")
                 section("Top 5 Past Due · Current Tenants")
 
                 def _ccol2(p):
@@ -4128,7 +4185,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                                        sub=f"{_wo_comp_pct:.0f}% completed"), unsafe_allow_html=True)
             with wo2: st.markdown(kpi("Open", f"{_wo_open:,}",
                                        status="bad" if _wo_open > 30 else "warn" if _wo_open > 15 else "good",
-                                       sub="Assigned · Estimated · New · Scheduled · Work Done"), unsafe_allow_html=True)
+                                       sub="Assigned · New · Scheduled · Work Done"), unsafe_allow_html=True)
             wo3, wo4 = st.columns(2)
             with wo3: st.markdown(kpi("Completed", f"{_wo_completed:,}",
                                        status="good" if _wo_comp_pct >= 70 else "warn" if _wo_comp_pct >= 50 else "bad",
@@ -4583,18 +4640,10 @@ if st.session_state.page == "Overview":
     notice_ren     = int(_totals.get("Notice-Rented", 0))
     revenue_gap    = float(df_metrics_f["Revenue Gap ($)"].sum()) if "Revenue Gap ($)" in df_metrics_f.columns else 0
 
-    # Sum of rent + % collected (Current tenants only)
-    sum_rent = pct_collected = 0.0
-    if df_rr_f is not None and "Rent" in df_rr_f.columns:
-        df_curr = df_rr_f[df_rr_f["Status"] == "Current"]
-        sum_rent = float(df_curr["Rent"].sum())
-        if "Past Due" in df_curr.columns:
-            pd_sum = clean_money_column(df_curr["Past Due"]).clip(lower=0).sum()  # credits = fully collected
-            if sum_rent > 0:
-                pct_collected = max(0, min(100, (sum_rent - pd_sum) / sum_rent * 100))
+    sum_rent, pd_sum, _overview_collected, pct_collected, _overview_props = monthly_rent_collection(
+        df_rr_f, _f(df_aged_all), pd.Timestamp(now().date()).to_period("M"))
 
-    if sum_rent > 0:
-        pct_collected = max(0, min(100, (sum_rent - pd_sum) / sum_rent * 100))
+    st.caption("Collection Rate: monthly rent less reporting-month Rental Income and Section 8 balances, for Current residents and selected properties. Balance-based calculation; not a cash-receipts report.")
 
     # Renewal rate
     renewal_rate = 0.0
@@ -4697,7 +4746,7 @@ if st.session_state.page == "Overview":
                               sub="Sum of rent — Current tenants only"), unsafe_allow_html=True)
     with c5: st.markdown(kpi("% Collected", f"{pct_collected:.1f}%", delta_coll, "%",
                               status=_tl(pct_collected, THR["collection_rate"]),
-                              sub=f"Target {THR['collection_rate']}% · Rent roll basis",
+                              sub=f"Target {THR['collection_rate']}% monthly rent collection",
                               delta_label=_prev_date_label), unsafe_allow_html=True)
     with c6: st.markdown(kpi("Revenue Gap", f"${revenue_gap:,.0f}",
                               sub="Market rent at risk: Vacant-Unrented + Evict units"),
@@ -5886,25 +5935,11 @@ elif st.session_state.page == "Collection":
     if "Rent"     in df_c.columns: df_c["Rent"]     = df_c["Rent"].astype(float)
     if "Past Due" in df_c.columns: df_c["Past Due"] = clean_money_column(df_c["Past Due"])
 
-    billed = df_c["Rent"].sum() if "Rent" in df_c.columns else 0
-
-    # Solo saldos realmente pendientes.
-    # Los créditos negativos no reducen el outstanding balance.
-    past_due = (
-        df_c["Past Due"]
-        .clip(lower=0)
-        .sum()
-        if "Past Due" in df_c.columns
-        else 0
-    )
-
-    collected = max(0.0, billed - past_due)
-
-    pct_c = (
-        max(0.0, min(100.0, collected / billed * 100))
-        if billed > 0
-        else 0.0
-    )
+    billed, past_due, collected, pct_c, prop_c = monthly_rent_collection(
+        df_rr_f, _f(df_aged_all), pd.Timestamp(now().date()).to_period("M"))
+    st.caption("Calculated as monthly rent less outstanding Rental Income and Section 8 charges for the reporting month. Current residents only; the same property filters apply to both amounts. This balance calculation is not a cash-receipts report.")
+    if pd.isna(pct_c):
+        st.warning("Collection rate unavailable: current-month charge detail or resident identifiers are missing.")
 
     # ------------------------------------------------------------------
     # Section 8 Performance — current month only
@@ -5972,12 +6007,12 @@ elif st.session_state.page == "Collection":
 
     c1,c2,c3 = st.columns(3)
     with c1: st.markdown(kpi("Total Billed", f"${billed:,.0f}",
-                              sub="Monthly rent — Current tenants"), unsafe_allow_html=True)
+                              sub="Scheduled monthly rent · Current tenants"), unsafe_allow_html=True)
     with c2: st.markdown(kpi("Amount Collected", f"${collected:,.0f}",
-                              sub="Billed minus Past Due balance"), unsafe_allow_html=True)
+                              sub="Monthly rent less current-month rent balance"), unsafe_allow_html=True)
     with c3: st.markdown(kpi("Outstanding Balance", f"${past_due:,.0f}",
                               status=_tl(pct_c, THR["collection_rate"]),
-                              sub="Past Due from rent roll · All ages · Current tenants only"),
+                              sub="Current-month rent + Section 8 · Current tenants"),
                          unsafe_allow_html=True)
 
     
@@ -6046,13 +6081,6 @@ elif st.session_state.page == "Collection":
         )
 
     section("% Collected by Property")
-    if "Past Due" not in df_c.columns:
-        df_c["Past Due"] = 0.0
-    prop_c = (df_c.groupby("Property")
-                  .agg(billed=("Rent","sum"), past_due=("Past Due","sum"))
-                  .reset_index())
-    prop_c["pct"] = ((prop_c["billed"]-prop_c["past_due"])/prop_c["billed"]*100).clip(0,100).fillna(100)
-
     _COLL_BRACKETS = {
         "🔴  Critical  (<85%)":        ("#991B1B", lambda p: p < 85),
         "🟠  Below target  (85–94%)":  ("#C2410C", lambda p: 85 <= p < 95),
@@ -6120,7 +6148,7 @@ elif st.session_state.page == "Collection":
     prop_c_disp["#"]            = range(1, len(prop_c_disp) + 1)
     prop_c_disp["% Collected"]  = prop_c_disp["pct"].map(lambda x: f"{x:.1f}%")
     prop_c_disp["Billed"]       = prop_c_disp["billed"].map(lambda x: f"${x:,.0f}")
-    prop_c_disp["Collected"]    = (prop_c_disp["billed"]-prop_c_disp["past_due"]).map(lambda x: f"${x:,.0f}")
+    prop_c_disp["Collected"]    = prop_c_disp["collected"].map(lambda x: f"${x:,.0f}")
     prop_c_disp["Outstanding"]  = prop_c_disp["past_due"].map(lambda x: f"${x:,.0f}")
     disp_c = ["#", "Property", "Billed", "Collected", "Outstanding", "% Collected"]
     c_ct, c_dct = st.columns([4,1])
@@ -6709,7 +6737,7 @@ elif st.session_state.page == "Operations/Maintenance":
 
             section(f"Work Order Aging  ·  {_n_overdue} overdue (>{_aging_thr}d open)")
             ag1, ag2, ag3 = st.columns(3)
-            with ag1: st.markdown(kpi("Open WOs", f"{len(_open_wo):,}", sub="Scheduled · Assigned · Work Done · New · Estimated"), unsafe_allow_html=True)
+            with ag1: st.markdown(kpi("Open WOs", f"{len(_open_wo):,}", sub="Scheduled · Assigned · Work Done · New"), unsafe_allow_html=True)
             with ag2: st.markdown(kpi(f"Overdue  (>{_aging_thr}d)", f"{_n_overdue:,}",
                                       status="bad" if _pct_over > 30 else "warn" if _pct_over > 10 else "good",
                                       sub=f"{_pct_over}% of open WOs"), unsafe_allow_html=True)

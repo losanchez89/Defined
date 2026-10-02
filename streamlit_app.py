@@ -3461,9 +3461,8 @@ if st.session_state.page == "All Hands":
         ) or "<li>No notes added.</li>"
 
         # ── Calls summary ─────────────────────────────────────────────────
-        _calls_total = _calls_inbound = _calls_outbound = _calls_missed = 0
+        _calls_total = _calls_inbound = _calls_outbound = 0
         _calls_avg_daily = 0.0
-        _calls_missed_pct = 0.0
         _calls_period_text = "Latest available period"
         _agents_rows_html = ""
         _inbound_rows_html = (
@@ -3506,12 +3505,7 @@ if st.session_state.page == "All Hands":
             _calls_total = int(_calls_tbl["Total Calls"].sum())
             _calls_inbound = int(_calls_tbl["Inbound"].sum())
             _calls_outbound = int(_calls_tbl["Outbound"].sum())
-            _calls_missed = int(_calls_tbl["Missed with VM"].sum())
             _calls_avg_daily = float(_calls_tbl["Avg Daily"].sum())
-            _calls_missed_pct = (_calls_missed / _calls_inbound * 100
-                if _calls_inbound > 0
-                else 0.0
-        )
 
             if calls_meta:
                 _ps = calls_meta.get("start")
@@ -3679,7 +3673,7 @@ if st.session_state.page == "All Hands":
   ul{{padding-left:18px;color:#374151;}}
   li{{margin-bottom:3px;font-size:12px;}}
   .section-note{{font-size:10px;color:#94A3B8;margin:-6px 0 10px 0;}}
-  .calls-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;}}
+  .calls-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px;}}
   .calls-grid .card{{padding:10px 12px;}}
   .calls-grid .card-val{{font-size:20px;}}
   .table-wrap{{border:1px solid #E2E8F0;border-radius:8px;overflow:hidden;margin-bottom:16px;}}
@@ -3745,11 +3739,7 @@ if st.session_state.page == "All Hands":
     <div class="card-val">{_calls_outbound:,}</div>
   </div>
   <div class="card">
-    <div class="card-label">Missed Call Rate</div>
-    <div class="card-val">{_calls_missed_pct:.1f}%</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Avg Daily</div>
+    <div class="card-label">Avg Calls / Day</div>
     <div class="card-val">{_calls_avg_daily:,.0f}</div>
   </div>
 </div>

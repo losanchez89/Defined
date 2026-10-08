@@ -81,8 +81,44 @@ def get_call_date(xlsx_file: str) -> str:
     return end_date.strftime("%Y-%m-%d")
 
 
-def upload_daily_calls_users() -> None:
-    xlsx_file = r"data/raw/daily_calls.xlsx"
+def get_expected_totals(xlsx_file: str) -> dict[str, int]:
+    """Obtiene los controles del resumen para validar el detalle por agente."""
+    kpi = pd.read_excel(
+        xlsx_file,
+        sheet_name="KPI_KPI",
+        dtype=str,
+    )
+
+    required_columns = {"KPI Name", "Numbers"}
+    missing_columns = required_columns.difference(kpi.columns)
+    if missing_columns:
+        raise ValueError(
+            "Faltan columnas en KPI_KPI: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    values = dict(
+        zip(
+            kpi["KPI Name"].astype(str).str.strip(),
+            kpi["Numbers"],
+        )
+    )
+
+    def clean_int(value) -> int:
+        number = pd.to_numeric(value, errors="coerce")
+        return 0 if pd.isna(number) else int(number)
+
+    return {
+        "total_calls": clean_int(values.get("# Total Calls")),
+        "inbound": clean_int(values.get("# Inbound")),
+        "outbound": clean_int(values.get("# Outbound")),
+        "missed_vm": clean_int(values.get("# Missed with VM")),
+    }
+
+
+def upload_daily_calls_users(
+    xlsx_file: str = r"data/raw/daily_calls.xlsx",
+) -> None:
 
     call_date = get_call_date(xlsx_file)
 
@@ -210,6 +246,36 @@ def upload_daily_calls_users() -> None:
             }
         )
     )
+
+    expected = get_expected_totals(xlsx_file)
+    actual = {
+        "total_calls": int(df["total_calls"].sum()),
+        "inbound": int(df["inbound"].sum()),
+        "outbound": int(df["outbound"].sum()),
+        "missed_vm": int(df["missed_vm"].sum()),
+    }
+
+    mismatches = [
+        key
+        for key in expected
+        if expected[key] != actual[key]
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{key}: KPI={expected[key]} / agentes={actual[key]}"
+            for key in mismatches
+        )
+        raise ValueError(
+            "El detalle diario no coincide con KPI_KPI ("
+            + details
+            + "). No se reemplazaron datos en Supabase."
+        )
+
+    if actual["total_calls"] <= 0:
+        raise ValueError(
+            "El reporte diario no contiene llamadas por agente. "
+            "No se reemplazaron datos en Supabase."
+        )
 
     records = []
 

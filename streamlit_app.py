@@ -2537,6 +2537,9 @@ def _owner_portfolios():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _calls_data():
+    supabase_df = None
+    supabase_meta = None
+
     # ── Try Supabase first ───────────────────────────────────────────────
     try:
         snap = _latest_snapshot("calls")
@@ -2564,7 +2567,8 @@ def _calls_data():
                 period_end   = pd.to_datetime(df["period_end"].iloc[0], errors="coerce") \
                                if "period_end"   in df.columns else None
                 meta = {"start": period_start, "end": period_end}
-                return df.sort_values("Total Calls", ascending=False).reset_index(drop=True), meta
+                supabase_df = df.sort_values("Total Calls", ascending=False).reset_index(drop=True)
+                supabase_meta = meta
     except Exception as e:
         log.warning("calls desde Supabase: %s — fallback a xlsx", e)
 
@@ -2572,7 +2576,7 @@ def _calls_data():
     try:
         candidates = list(Path(DATA_DIR).glob("Users_Dashboard*.xlsx"))
         if not candidates:
-            return None, None
+            return supabase_df, supabase_meta
         fp = str(sorted(candidates, key=lambda x: x.stat().st_mtime, reverse=True)[0])
 
         raw = pd.read_excel(fp, sheet_name="Table_Table", header=None, dtype=str)
@@ -2599,10 +2603,23 @@ def _calls_data():
         ).fillna(0).round(1)
 
         meta = {"start": period_start, "end": period_end}
-        return df.sort_values("Total Calls", ascending=False).reset_index(drop=True), meta
+        local_df = df.sort_values("Total Calls", ascending=False).reset_index(drop=True)
+
+        # Prefer the source with the newest reporting end date. Previously a
+        # valid but stale Supabase snapshot prevented the freshly downloaded
+        # Users_Dashboard workbook from being used.
+        supabase_end = pd.to_datetime(
+            (supabase_meta or {}).get("end"), errors="coerce"
+        )
+        local_end = pd.to_datetime(period_end, errors="coerce")
+        if supabase_df is None or pd.isna(supabase_end) or (
+            not pd.isna(local_end) and local_end > supabase_end
+        ):
+            return local_df, meta
+        return supabase_df, supabase_meta
     except Exception as e:
         log.error("Users_Dashboard XLSX: %s", e)
-        return None, None
+        return supabase_df, supabase_meta
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2625,6 +2642,84 @@ def _daily_call_dates() -> list[str]:
 @st.cache_data(ttl=300, show_spinner=False)
 def _daily_calls_data(call_date: str):
     """Loads one daily summary row and its per-agent detail from Supabase."""
+    # Prefer an exact-date local RingCentral workbook when the daily download
+    # is present. This also provides a safe fallback when the Supabase ETL
+    # parsed the wrong worksheet or stored incomplete per-agent rows.
+    try:
+        app_dir = Path(__file__).resolve().parent
+        search_dirs = [
+            Path(DATA_DIR),
+            Path(DATA_DIR) / "data" / "raw",
+            app_dir / "data" / "raw",
+        ]
+        candidates_by_path = {}
+        for search_dir in search_dirs:
+            for candidate in search_dir.glob("daily_calls*.xlsx"):
+                candidates_by_path[str(candidate.resolve())] = candidate
+        candidates = sorted(
+            candidates_by_path.values(),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        for fp in candidates:
+            raw = pd.read_excel(fp, sheet_name="Table_Table", header=None, dtype=str)
+            report_date = pd.to_datetime(raw.iat[3, 1], errors="coerce")
+            if pd.isna(report_date) or report_date.date().isoformat() != str(call_date):
+                continue
+
+            header_idx = None
+            for idx, row in raw.iterrows():
+                values = [str(value).strip() for value in row.tolist()]
+                if "Name" in values and "Total Calls" in values:
+                    header_idx = idx
+                    break
+            if header_idx is None:
+                continue
+
+            local_df = raw.iloc[header_idx + 2:, :7].copy()
+            local_df.columns = [
+                "Name", "Ext", "Total Calls", "Avg Daily",
+                "Inbound", "Outbound", "Missed with VM",
+            ]
+            local_df["Name"] = local_df["Name"].fillna("").astype(str).str.strip()
+            local_df = local_df[local_df["Name"] != ""].copy()
+            for col in ["Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]:
+                local_df[col] = pd.to_numeric(local_df[col], errors="coerce").fillna(0)
+            for col in ["Total Calls", "Inbound", "Outbound", "Missed with VM"]:
+                local_df[col] = local_df[col].astype(int)
+            local_df["Missed VM %"] = (
+                local_df["Missed with VM"]
+                / local_df["Inbound"].replace(0, float("nan"))
+                * 100
+            ).fillna(0).round(1)
+
+            local_summary = {}
+            try:
+                kpi_raw = pd.read_excel(fp, sheet_name="KPI_KPI")
+                kpi_map = dict(zip(kpi_raw["KPI Name"], kpi_raw["Numbers"]))
+                local_summary = {
+                    "total_calls": pd.to_numeric(kpi_map.get("# Total Calls"), errors="coerce"),
+                    "inbound": pd.to_numeric(kpi_map.get("# Inbound"), errors="coerce"),
+                    "outbound": pd.to_numeric(kpi_map.get("# Outbound"), errors="coerce"),
+                    "missed_vm": pd.to_numeric(kpi_map.get("# Missed with VM"), errors="coerce"),
+                }
+                _duration = pd.to_timedelta(
+                    str(kpi_map.get("Avg. Handle Time", "0:00:00")),
+                    errors="coerce",
+                )
+                local_summary["avg_duration_seconds"] = (
+                    float(_duration.total_seconds()) if not pd.isna(_duration) else 0.0
+                )
+            except Exception as e:
+                log.warning("daily calls KPI workbook parse failed for %s: %s", fp, e)
+
+            return (
+                local_df.sort_values("Total Calls", ascending=False).reset_index(drop=True),
+                local_summary,
+            )
+    except Exception as e:
+        log.warning("daily calls local workbook fallback failed for %s: %s", call_date, e)
+
     try:
         summary_rows = (
             supabase.table("daily_calls_summary")
@@ -7433,6 +7528,9 @@ elif st.session_state.page == "Calls":
 
     # Normalize required columns so both sources render identically.
     df_calls_view = df_calls_view.copy()
+    if "Name" not in df_calls_view.columns:
+        df_calls_view["Name"] = ""
+    df_calls_view["Name"] = df_calls_view["Name"].fillna("").astype(str).str.strip()
     required_numeric = ["Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]
     for col in required_numeric:
         if col not in df_calls_view.columns:
@@ -7450,21 +7548,53 @@ elif st.session_state.page == "Calls":
             df_calls_view["Missed VM %"], errors="coerce"
         ).fillna(0)
 
+    # Validate daily detail against the KPI summary. RingCentral exports the
+    # summary and per-user table separately; if the ETL parsed the wrong table,
+    # never present the incomplete agent rows as the daily total.
+    def _daily_summary_number(*keys, default=0.0):
+        for key in keys:
+            if key in daily_summary and daily_summary.get(key) not in (None, ""):
+                try:
+                    return float(daily_summary.get(key))
+                except (TypeError, ValueError):
+                    continue
+        return float(default)
+
+    daily_detail_mismatch = False
+    if is_daily_view:
+        _summary_total_check = _daily_summary_number("total_calls", "Total Calls")
+        _detail_total_check = float(df_calls_view["Total Calls"].sum())
+        daily_detail_mismatch = (
+            _summary_total_check > 0
+            and abs(_summary_total_check - _detail_total_check) > max(1.0, _summary_total_check * 0.01)
+        )
+
     # Active agents only, then optional configured team filter.
     df_active = df_calls_view[df_calls_view["Total Calls"] > 0].copy()
     if phone_only:
-        df_active = df_active[df_active["Name"].apply(_is_phone_team)].copy()
-    df_active = df_active.sort_values("Total Calls", ascending=False).reset_index(drop=True)
+        _phone_mask = df_active["Name"].map(_is_phone_team).fillna(False).astype(bool)
+        df_active = df_active.loc[_phone_mask].copy()
 
-    if df_active.empty:
+    if df_active.empty and not daily_detail_mismatch:
         st.info("No active agents match the selected filters.")
         st.stop()
 
+    if not df_active.empty:
+        df_active = df_active.sort_values("Total Calls", ascending=False).reset_index(drop=True)
+
     # ── KPIs ──────────────────────────────────────────────────────────────
-    total_calls = int(df_active["Total Calls"].sum())
-    total_inbound = int(df_active["Inbound"].sum())
-    total_outbound = int(df_active["Outbound"].sum())
-    total_missed = int(df_active["Missed with VM"].sum())
+    if daily_detail_mismatch:
+        total_calls = int(_daily_summary_number("total_calls", "Total Calls"))
+        total_inbound = int(_daily_summary_number("inbound", "Inbound"))
+        total_outbound = int(_daily_summary_number("outbound", "Outbound"))
+        total_missed = int(_daily_summary_number(
+            "missed_vm", "missed_with_vm", "Missed with VM"
+        ))
+    else:
+        total_calls = int(df_active["Total Calls"].sum())
+        total_inbound = int(df_active["Inbound"].sum())
+        total_outbound = int(df_active["Outbound"].sum())
+        total_missed = int(df_active["Missed with VM"].sum())
     missed_pct = round(total_missed / total_inbound * 100, 1) if total_inbound > 0 else 0
     n_agents = len(df_active)
 
@@ -7475,7 +7605,11 @@ elif st.session_state.page == "Calls":
 
     with c1:
         st.markdown(
-            kpi("Total Calls", f"{total_calls:,}", sub=f"{n_agents} active agents"),
+            kpi(
+                "Total Calls",
+                f"{total_calls:,}",
+                sub="daily report summary" if daily_detail_mismatch else f"{n_agents} active agents",
+            ),
             unsafe_allow_html=True,
         )
     with c2:
@@ -7518,6 +7652,13 @@ elif st.session_state.page == "Calls":
                 ),
                 unsafe_allow_html=True,
             )
+
+    if daily_detail_mismatch:
+        st.warning(
+            "The daily KPI summary is available, but the per-agent detail does not match it. "
+            "The totals above use the daily summary; agent charts are hidden to avoid showing incorrect data."
+        )
+        st.stop()
 
     # ── Charts ────────────────────────────────────────────────────────────
     col_l, col_r = st.columns(2)

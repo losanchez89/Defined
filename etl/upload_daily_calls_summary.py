@@ -39,8 +39,9 @@ def duration_to_seconds(value):
         return 0.0
 
 
-def upload_daily_calls_summary():
-    xlsx_file = r"data/raw/daily_calls.xlsx"
+def upload_daily_calls_summary(
+    xlsx_file: str = r"data/raw/daily_calls.xlsx",
+):
 
     df = pd.read_excel(
         xlsx_file,
@@ -103,6 +104,19 @@ def upload_daily_calls_summary():
     avg_duration_seconds = duration_to_seconds(
         kpis.get("Avg. Handle Time")
     )
+
+    if total_calls != inbound + outbound:
+        raise ValueError(
+            "El resumen diario no cuadra: "
+            f"Total={total_calls}, Inbound={inbound}, "
+            f"Outbound={outbound}. No se reemplazaron datos en Supabase."
+        )
+
+    if total_calls <= 0:
+        raise ValueError(
+            "El reporte diario no contiene llamadas. "
+            "No se reemplazaron datos en Supabase."
+        )
 
     record = {
         "call_date": call_date,

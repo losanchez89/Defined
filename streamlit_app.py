@@ -850,6 +850,26 @@ section[data-testid="stSidebar"] [data-testid="stMultiSelect"] > div {{
     border-color: rgba(255,255,255,.12) !important;
     border-radius: 8px !important;
 }}
+/* Sidebar scrollbar: light sky blue so it is visible on the dark blue background */
+section[data-testid="stSidebar"] *,
+section[data-testid="stSidebar"] {{
+    scrollbar-color: #BAE6FD transparent;
+    scrollbar-width: thin;
+}}
+section[data-testid="stSidebar"] ::-webkit-scrollbar {{
+    width: 8px;
+    height: 8px;
+}}
+section[data-testid="stSidebar"] ::-webkit-scrollbar-track {{
+    background: transparent;
+}}
+section[data-testid="stSidebar"] ::-webkit-scrollbar-thumb {{
+    background: #BAE6FD;
+    border-radius: 8px;
+}}
+section[data-testid="stSidebar"] ::-webkit-scrollbar-thumb:hover {{
+    background: #7DD3FC;
+}}
 /* Sidebar selects: bigger, darker selected value (e.g. property name) */
 section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] div,
 section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] input,
@@ -1142,21 +1162,37 @@ def _latest_snapshot(table: str, max_attempts: int = 4) -> str | None:
             time.sleep(delay)
 
 
+_TABLES_WITHOUT_ID: set = set()
+
+
 def _fetch_all(table: str, snap: str, page_size: int = 1000, max_attempts: int = 4) -> list:
-    """Fetch all snapshot rows with pagination and transient-network retries."""
+    """Fetch all snapshot rows with pagination and transient-network retries.
+
+    Pages are ordered by the primary key "id". Without a fixed order, Postgres
+    may return rows in a different order on each page, so some rows were
+    duplicated and others silently skipped (e.g. missing October balances in
+    aged_receivable, which has ~5,000 rows = 6 pages).
+    """
     rows, start = [], 0
     while True:
         page = None
         for attempt in range(1, max_attempts + 1):
             try:
-                res = supabase.table(table)\
+                q = supabase.table(table)\
                     .select("*")\
-                    .eq("snapshot_date", snap)\
-                    .range(start, start + page_size - 1)\
-                    .execute()
+                    .eq("snapshot_date", snap)
+                if table not in _TABLES_WITHOUT_ID:
+                    q = q.order("id")
+                res = q.range(start, start + page_size - 1).execute()
                 page = res.data or []
                 break
             except Exception as exc:
+                msg = str(exc).lower()
+                if table not in _TABLES_WITHOUT_ID and "id" in msg and ("does not exist" in msg or "42703" in msg):
+                    # Table has no "id" column: fall back to unordered paging.
+                    _TABLES_WITHOUT_ID.add(table)
+                    log.warning("Table %s has no id column; fetching without order", table)
+                    continue
                 if attempt >= max_attempts:
                     log.error(
                         "Supabase fetch failed after %s attempts: table=%s snapshot=%s offset=%s: %s",
@@ -1530,6 +1566,7 @@ def _monthly_leasing(year: int, month: int) -> dict:
                 .select("showing_time,status,property,unit")\
                 .gte("showing_time", month_start)\
                 .lte("showing_time", f"{month_end} 23:59:59")\
+                .order("id")\
                 .range(start, start + 999).execute().data
             all_sh += rows
             if len(rows) < 1000:
@@ -1550,6 +1587,7 @@ def _monthly_leasing(year: int, month: int) -> dict:
                 .select("received,status,property,applicant,snapshot_date")\
                 .gte("received", month_start)\
                 .lte("received", month_end)\
+                .order("id")\
                 .range(start, start + 999).execute().data
             all_ap += rows
             if len(rows) < 1000:
@@ -1970,6 +2008,7 @@ def _showings_history(weeks: int = 8):
                 .select("*")
                 .gte("snapshot_date", _snapshot_start)
                 .lte("snapshot_date", _snapshot_end)
+                .order("id")
                 .range(start, start + 999)
                 .execute()
                 .data
@@ -2046,6 +2085,7 @@ def _completed_showings_weekly_from_funnel(properties: tuple[str, ...] = (), wee
                 .select("snapshot_date,property,completed_showings")
                 .gte("snapshot_date", _query_start)
                 .lte("snapshot_date", _query_end)
+                .order("id")
                 .range(start, start + 999)
                 .execute()
                 .data
@@ -2148,6 +2188,7 @@ def _leasing_funnel_activity_range(start_date, end_date, properties: tuple[str, 
                 .select("snapshot_date,property,inquiries,completed_showings,rental_apps")
                 .gte("snapshot_date", _query_start)
                 .lte("snapshot_date", _query_end)
+                .order("id")
                 .range(offset, offset + 999)
                 .execute()
                 .data
@@ -2473,109 +2514,59 @@ def save_portfolio_history_snapshot(row: dict, max_attempts: int = 3):
             time.sleep(delay)
 
 
+UNASSIGNED_PORTFOLIO = "Unassigned"
+EXCLUDED_PORTFOLIO = "__EXCLUDED__"   # listed in Portfolio.xlsx with an empty Portfolio
+PORTFOLIO_FILE = Path(__file__).resolve().parent / "data" / "Portfolio.xlsx"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _owner_portfolios():
     """
-    Reads owner_directory-*.csv and returns a dict {clean_property_name: portfolio}.
+    Returns {property name (as in the rent roll): portfolio} from data/Portfolio.xlsx.
 
-    Portfolio assignment rules (in order):
-      1. Email domain @seaviewcapitalcorp.com  → "Seaview Capital"
-      2. Email domain @boldpartnersre.com      → "Bold Partners"
-      3. Property name contains "mirada"       → "Bold Partners"  (La Mirada override)
-      4. Empty email / no match               → "Defined Property Management"
+    The file is maintained by hand (not updated by email) and lives in the repo,
+    so Railway has it too. Columns: Property | Portfolio.
+    "Bold - Portfolio" is shown as "Bold". Properties missing from the file
+    fall under "Unassigned". Properties listed with an EMPTY Portfolio
+    (e.g. JTM Land) are excluded from the property/portfolio filters.
     """
-    DEFAULT = "Defined Property Management"
-
     try:
-        fp = find_csv_file(str(DATA_DIR), "owner_directory")
-        if not fp:
+        if not PORTFOLIO_FILE.exists():
+            log.warning("Portfolio file not found: %s", PORTFOLIO_FILE)
+            return {}
+        df_pf = pd.read_excel(PORTFOLIO_FILE, dtype=str)
+        df_pf.columns = [str(c).strip() for c in df_pf.columns]
+        if not {"Property", "Portfolio"}.issubset(df_pf.columns):
+            log.warning("Portfolio file needs columns 'Property' and 'Portfolio'")
             return {}
 
-        df_own = pd.read_csv(fp, dtype=str).fillna("")
-
-        def _pf_from_email(email_str):
-            for e in email_str.lower().split(","):
-                e = e.strip()
-                if "seaview" in e:
-                    return "Seaview Capital"
-                if "bold" in e:
-                    return "Bold Partners"
-            return DEFAULT
-
-        col = "Properties Owned"
-        if col not in df_own.columns:
-            return {}
-
-        # Build {norm_key: portfolio} from owner directory entries
-        owner_key_map = {}
-        for _, row in df_own.iterrows():
-            pf = _pf_from_email(str(row.get("Email", "")))
-            props_str = str(row.get(col, "") or "")
-            if not props_str or props_str == "nan":
+        mapping = {}
+        for prop, pf in zip(df_pf["Property"], df_pf["Portfolio"]):
+            prop = str(prop).strip() if pd.notna(prop) else ""
+            pf = str(pf).strip() if pd.notna(pf) else ""
+            if not prop:
                 continue
-            # Split multi-property strings: "1133 25th St (100%), 1134 26th St (100%)"
-            for part in re.split(r'\)\s*,\s*', props_str):
-                # strip both "(100%)" and "(100" (closing paren consumed by split)
-                part = re.sub(r'\s*\(\d+%?\)?', '', part).strip()
-                if not part:
-                    continue
-                # La Mirada hardcoded override
-                if "mirada" in part.lower():
-                    pf = "Bold Partners"
-                k = _norm_key(part)
-                if k:
-                    owner_key_map[k] = pf
-
-        # Match against rent roll to get clean property names
-        rr_fp = find_csv_file(str(DATA_DIR), "rent_roll")
-        if not rr_fp:
-            return {}
-
-        df_raw = pd.read_csv(rr_fp, header=None, dtype=str)
-        hr = detect_header_row(df_raw)
-        df_rr_raw = pd.read_csv(rr_fp, skiprows=hr, dtype=str)
-
-        if "Property" not in df_rr_raw.columns:
-            return {}
-
-        prop_to_pf = {}
-        for raw_name in df_rr_raw["Property"].dropna().unique():
-            clean = clean_property_name(str(raw_name))
-            if not clean or clean in prop_to_pf:
+            if not pf or pf.lower() == "nan":
+                mapping[prop] = EXCLUDED_PORTFOLIO
                 continue
-
-            # Build candidate keys to try against owner_key_map
-            candidates = [_norm_key(clean)]           # e.g. "gardendale park"
-            if " - " in raw_name:
-                addr_part = raw_name.split(" - ", 1)[1]
-                candidates.append(_norm_key(addr_part))   # e.g. "8350 gardendale paramount"
-            candidates.append(_norm_key(raw_name))        # full raw key
-
-            matched = False
-            for k in candidates:
-                if k in owner_key_map:
-                    prop_to_pf[clean] = owner_key_map[k]
-                    matched = True
-                    break
-                # Subset match: owner key tokens ⊆ candidate tokens (min 2 tokens required)
-                k_tokens = set(k.split())
-                for ok, opf in owner_key_map.items():
-                    ok_tokens = set(ok.split())
-                    if len(ok_tokens) >= 2 and ok_tokens.issubset(k_tokens):
-                        prop_to_pf[clean] = opf
-                        matched = True
-                        break
-                if matched:
-                    break
-
-            if not matched:
-                prop_to_pf[clean] = DEFAULT
-
-        return prop_to_pf
-
+            pf = re.sub(r"\s*-\s*portfolio\s*$", "", pf, flags=re.IGNORECASE).strip() or pf
+            mapping[prop] = pf
+        return mapping
     except Exception as e:
-        log.error("owner_directory CSV: %s", e)
+        log.error("Portfolio.xlsx: %s", e)
         return {}
+
+
+def _portfolio_of(prop, mapping):
+    """Exact match first, then whitespace/case-insensitive match."""
+    if prop in mapping:
+        return mapping[prop]
+    norm = lambda x: " ".join(str(x).split()).casefold()
+    target = norm(prop)
+    for k, v in mapping.items():
+        if norm(k) == target:
+            return v
+    return UNASSIGNED_PORTFOLIO
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2999,35 +2990,8 @@ with st.spinner("Loading portfolio data…"):
 
        
     # Build portfolio map — local CSV is authoritative; Supabase is fallback only
+    # Portfolio assignment comes only from data/Portfolio.xlsx (maintained by hand).
     prop_portfolio_map = _owner_portfolios()
-    if not prop_portfolio_map:
-        _rr_all_raw = _rent_roll_all()
-        if _rr_all_raw is not None and "Portfolio" in _rr_all_raw.columns and "Property" in _rr_all_raw.columns:
-            _pf_df = (
-                _rr_all_raw[["Property", "Portfolio"]]
-                .dropna(subset=["Property", "Portfolio"])  # only rows with known portfolio
-                .drop_duplicates("Property")
-            )
-            if _pf_df.empty:
-                # Today's snapshot has NULL portfolios — fetch from most recent good snapshot
-                try:
-                    _good_rows = supabase.table("rent_roll")\
-                        .select("property,portfolio")\
-                        .neq("portfolio", "Defined Property Management")\
-                        .not_.is_("portfolio", "null")\
-                        .limit(500)\
-                        .execute().data
-                    if _good_rows:
-                        _pf_df = pd.DataFrame(_good_rows)\
-                            .rename(columns={"property": "Property", "portfolio": "Portfolio"})\
-                            .drop_duplicates("Property")
-                except Exception as _e:
-                    log.warning("portfolio fallback query failed: %s", _e)
-            prop_portfolio_map = (
-                _pf_df.set_index("Property")["Portfolio"].to_dict()
-                if not _pf_df.empty else {}
-            )
-
 
 df_hist = load_historical_metrics()
 
@@ -3051,13 +3015,17 @@ all_props = sorted(df_metrics["Property"].tolist()) if df_metrics is not None el
 
 # Derive the portfolio each property belongs to; unknown → Defined
 _PORTFOLIO_COLORS = {
-    "Seaview Capital":              "#1B4FD8",
-    "Bold Partners":                "#059669",
-    "Defined Property Management":  "#D97706",
+    "Seaview":     "#1B4FD8",
+    "Bold":        "#059669",
+    "Vista":       "#7C3AED",
+    UNASSIGNED_PORTFOLIO: "#64748B",
 }
 _ALL_PORTFOLIOS = "All Portfolios"
-_known_portfolios = sorted({prop_portfolio_map.get(p) or "Defined Property Management"
-                             for p in all_props})
+# Properties listed with an empty Portfolio (e.g. JTM Land) are left out of every
+# total and portfolio; they can only be viewed by searching them by name.
+_excluded_props = sorted(p for p in all_props if _portfolio_of(p, prop_portfolio_map) == EXCLUDED_PORTFOLIO)
+all_props = [p for p in all_props if p not in _excluded_props]
+_known_portfolios = sorted({_portfolio_of(p, prop_portfolio_map) for p in all_props})
 _portfolio_options = [_ALL_PORTFOLIOS] + _known_portfolios
 
 if "prop_filter" not in st.session_state:
@@ -3133,9 +3101,9 @@ with st.sidebar:
 
     # ── Property sub-filter (scoped to selected portfolio) ──────────────
     _props_in_pf = (
-        [p for p in all_props if prop_portfolio_map.get(p, "Defined Property Management") == selected_portfolio]
+        [p for p in all_props if _portfolio_of(p, prop_portfolio_map) == selected_portfolio]
         if selected_portfolio != _ALL_PORTFOLIOS
-        else all_props
+        else all_props + _excluded_props   # excluded ones only findable by search
     )
     _valid_prop_default = [p for p in st.session_state.prop_filter if p in _props_in_pf]
     if _props_in_pf:
@@ -3247,13 +3215,19 @@ _prop_active = st.session_state.prop_filter
 
 if _pf_active != _ALL_PORTFOLIOS:
     _pf_props = [p for p in all_props
-                 if prop_portfolio_map.get(p, "Defined Property Management") == _pf_active]
+                 if _portfolio_of(p, prop_portfolio_map) == _pf_active]
     SEL = [p for p in _prop_active if p in _pf_props] if _prop_active else _pf_props
 else:
     SEL = _prop_active   # empty list = no filter (show all)
 
 def _f(df, col="Property"):
-    if df is None or not SEL: return df
+    if df is None:
+        return df
+    if not SEL:
+        # Whole portfolio: drop properties excluded in Portfolio.xlsx (e.g. JTM Land)
+        if _excluded_props and col in df.columns:
+            return df[~df[col].isin(_excluded_props)].copy()
+        return df
     return df[df[col].isin(SEL)].copy() if col in df.columns else df
 
 df_rr_f      = _f(df_rr)
@@ -3298,7 +3272,8 @@ if df_rr_f is not None and "Lease To" in df_rr_f.columns:
 
 # Module-level filtered totals — shared across all pages
 if df_metrics_f is not None and totals is not None:
-    if SEL:
+    if SEL or (_excluded_props and df_metrics is not None
+               and df_metrics["Property"].isin(_excluded_props).any()):
         _totals, _econ_occ, _phys_occ = calculate_totals_row(df_metrics_f)
     else:
         _totals, _phys_occ, _econ_occ = totals, phys_occ, econ_occ

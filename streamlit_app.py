@@ -148,29 +148,60 @@ def clean_property_name(name):
     return name.strip()
 
 
-def monthly_rent_collection(rr, aged, period):
-    """Estimate rent satisfied from scheduled rent less this month's rent receivables.
+# Residents billed rent this month: Current plus Notice (still living there).
+# Evict is excluded on purpose (legal process, tracked in Delinquency).
+COLLECTION_STATUSES = {"Current", "Notice-Unrented", "Notice-Rented"}
 
-    Aged detail contains open charges only, so Total Amount is NOT total billed.
-    Credits/payments cannot be distinguished; this is not cash receipts.
-    Missing detail must never silently imply 100% collection.
+
+def monthly_rent_collection(rr, aged, period):
+    """Monthly collection rate = (rent billed - this month's open rent balances) / rent billed.
+
+    rr:    rent roll (may be filtered to the selected properties).
+    aged:  Aged Receivable Detail for the WHOLE portfolio (do not pre-filter it):
+           it only lists open charges, so a property that owes nothing is simply
+           absent from it. Passing the full report lets us tell apart
+           "nothing owed" (100%) from "report not loaded" (unavailable).
+
+    Rules:
+      * Billed = Rent of Current + Notice residents (rent roll).
+      * Outstanding = Rental Income + Section 8 balances charged this month.
+      * Property with rent but no open balances -> 100%.
+      * Aged report missing/empty/without this month's charges -> rate unavailable (NaN),
+        but monthly rent is still returned.
+      * Property with rent = $0 -> rate unavailable (NaN) for that property.
+    Balance-based, not a cash-receipts report.
     """
     columns = ["Property", "billed", "past_due", "collected", "pct"]
     empty = pd.DataFrame(columns=columns)
-    if rr is None or aged is None or rr.empty or aged.empty:
-        return float("nan"), float("nan"), float("nan"), float("nan"), empty
+    nan = float("nan")
+    if rr is None or rr.empty or not {"Property", "Rent", "Status", "Tenant"}.issubset(rr.columns):
+        return nan, nan, nan, nan, empty
+
+    r = rr[rr["Status"].astype(str).str.strip().isin(COLLECTION_STATUSES) & rr["Property"].notna()].copy()
+    r["billed"] = clean_money_column(r["Rent"])
+    billed_total = float(r["billed"].sum())
+
+    if aged is None or aged.empty:
+        return billed_total, nan, nan, nan, empty
     a = aged.rename(columns={
         "property": "Property", "charge_date": "Charge Date",
         "gl_account_name": "GL Account Name", "amount_receivable": "Amount Receivable",
         "unit_id": "Unit ID", "payer_name": "Payer Name",
     }).copy()
     required = {"Property", "Charge Date", "GL Account Name", "Amount Receivable", "Payer Name"}
-    if not required.issubset(a.columns) or not {"Property", "Rent", "Status", "Tenant"}.issubset(rr.columns):
-        return float("nan"), float("nan"), float("nan"), float("nan"), empty
-    r = rr[rr["Status"].eq("Current") & rr["Property"].notna()].copy()
+    if not required.issubset(a.columns):
+        return billed_total, nan, nan, nan, empty
+
+    dates = pd.to_datetime(a["Charge Date"], errors="coerce")
+    month = pd.Period(period, freq="M")
+    in_month = dates.dt.to_period("M").eq(month)
+    if not in_month.any():
+        # The receivables report does not cover this month yet.
+        return billed_total, nan, nan, nan, empty
+
     use_unit_ids = ("Unit ID" in r.columns and "Unit ID" in a.columns
                     and r["Unit ID"].notna().all() and a["Unit ID"].notna().any())
-    r["billed"] = clean_money_column(r["Rent"])
+
     def identity(frame, name):
         ids = (pd.to_numeric(frame["Unit ID"], errors="coerce").astype("Int64").astype(str)
                if use_unit_ids else pd.Series("", index=frame.index))
@@ -178,21 +209,19 @@ def monthly_rent_collection(rr, aged, period):
         names = frame[name].fillna("").astype(str).map(
             lambda value: " ".join(sorted(re.findall(r"\w+", value.casefold()))))
         return frame["Property"].fillna("").astype(str).map(clean_property_name).str.casefold().str.strip() + "|" + ids + "|" + names
+
     r["_key"] = identity(r, "Tenant")
-    dates = pd.to_datetime(a["Charge Date"], errors="coerce")
-    month = pd.Period(period, freq="M")
-    if not dates.dt.to_period("M").eq(month).any():
-        return float(r["billed"].sum()), float("nan"), float("nan"), float("nan"), empty
-    a = a[dates.dt.to_period("M").eq(month) & a["GL Account Name"].fillna("").astype(str).str.strip().str.casefold().isin(["rental income", "section 8"])].copy()
+    a = a[in_month & a["GL Account Name"].fillna("").astype(str).str.strip().str.casefold().isin(["rental income", "section 8"])].copy()
     a["_key"] = identity(a, "Payer Name")
     a["_balance"] = clean_money_column(a["Amount Receivable"])
     balances = a.groupby("_key")["_balance"].sum()
+    # No open balance for a resident (or a whole property) means fully collected.
     r["past_due"] = r["_key"].map(balances).fillna(0).clip(lower=0)
     r["collected"] = r["billed"] - r["past_due"]
     props = r.groupby("Property")[["billed", "past_due", "collected"]].sum().reset_index()
     props["pct"] = props["collected"].div(props["billed"].where(props["billed"].gt(0))).mul(100).clip(0, 100)
     billed, outstanding, collected = (float(props[c].sum()) for c in ["billed", "past_due", "collected"])
-    rate = collected / billed * 100 if billed > 0 else float("nan")
+    rate = collected / billed * 100 if billed > 0 else nan
     return billed, outstanding, collected, rate, props
 
 
@@ -820,6 +849,20 @@ section[data-testid="stSidebar"] [data-testid="stMultiSelect"] > div {{
     background: rgba(255,255,255,.06) !important;
     border-color: rgba(255,255,255,.12) !important;
     border-radius: 8px !important;
+}}
+/* Sidebar selects: bigger, darker selected value (e.g. property name) */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] div,
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] input,
+section[data-testid="stSidebar"] [data-testid="stMultiSelect"] [data-baseweb="select"] input {{
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    color: #0F172A !important;
+    -webkit-text-fill-color: #0F172A !important;
+}}
+section[data-testid="stSidebar"] [data-testid="stMultiSelect"] [data-baseweb="tag"] span {{
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    max-width: 210px !important;
 }}
 
 /* ── KPI Card ────────────────────────────────────────────────────────── */
@@ -3075,6 +3118,7 @@ with st.sidebar:
     if selected_portfolio != st.session_state.portfolio_filter:
         st.session_state.portfolio_filter = selected_portfolio
         st.session_state.prop_filter = []   # clear property sub-filter on portfolio change
+        st.session_state.pop("prop_ms", None)
         st.rerun()
 
     # Show a colored indicator for active portfolio
@@ -3095,14 +3139,43 @@ with st.sidebar:
     )
     _valid_prop_default = [p for p in st.session_state.prop_filter if p in _props_in_pf]
     if _props_in_pf:
-        sel = st.multiselect(
+        def _prop_label(full_name):
+            """Short, searchable label: 'The Elmwood - 326 S. Normandie...' -> 'The Elmwood'."""
+            parts = [x.strip() for x in str(full_name).split(" - ") if x.strip()]
+            if len(parts) > 1:
+                parts = parts[:-1]          # drop the trailing full address
+            seen, out = set(), []
+            for x in parts:                 # drop repeated pieces (e.g. '16901')
+                if x.casefold() not in seen:
+                    seen.add(x.casefold())
+                    out.append(x)
+            return " - ".join(out) or str(full_name)
+
+        # Multi-select search: type to get suggestions, pick one or many.
+        # Empty = all properties (placeholder shows "All properties").
+        # "All properties" is also offered in the list: choosing it clears the selection.
+        _ALL_PROPS = "__ALL_PROPERTIES__"
+        _prop_opts = sorted(_props_in_pf, key=lambda p: _prop_label(p).casefold())
+
+        _cur = st.session_state.get("prop_ms")
+        if _cur is None:
+            _cur = _valid_prop_default
+        st.session_state.prop_ms = [x for x in _cur if x in _prop_opts]
+
+        def _on_prop_change():
+            if _ALL_PROPS in st.session_state.prop_ms:
+                st.session_state.prop_ms = []
+
+        st.multiselect(
             "Filter by property",
-            options=_props_in_pf,
-            default=_valid_prop_default,
-            placeholder="All properties",
+            options=[_ALL_PROPS] + _prop_opts,
+            key="prop_ms",
+            on_change=_on_prop_change,
+            format_func=lambda p: "All properties" if p == _ALL_PROPS else _prop_label(p),
+            placeholder="All properties · type to search",
             label_visibility="visible",
         )
-        st.session_state.prop_filter = sel
+        st.session_state.prop_filter = [x for x in st.session_state.prop_ms if x != _ALL_PROPS]
 
     st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:8px 0;">', unsafe_allow_html=True)
     if st.button("Refresh Data", width="stretch", type="secondary"):
@@ -3457,9 +3530,10 @@ if st.session_state.page == "All Hands":
             _ah_aged_data = df_aged_all.copy()
         _ah_aged_data = _ah_aged_data.rename(columns={"property": "Property"})
         _sum_rent, _ah_outstanding, _ah_collected, _pct_coll, _ah_collection_props = monthly_rent_collection(
-            df_rr_f, _f(_ah_aged_data), _ah_selected_period)
+            df_rr_f, _ah_aged_data, _ah_selected_period)
 
-    st.caption("Collection Rate: monthly rent less reporting-month Rental Income and Section 8 balances, for Current residents and selected properties. Balance-based calculation; not a cash-receipts report.")
+    _pct_txt = f"{_pct_coll:.1f}%" if pd.notna(_pct_coll) else "—"
+    st.caption("Collection Rate: monthly rent of Current and Notice residents less reporting-month Rental Income and Section 8 balances, for the selected properties. Properties with no open balances count as 100%. Balance-based calculation; not a cash-receipts report.")
 
     _wo_open = _wo_total = _wo_completed = 0
     _wo_comp_pct = 0.0
@@ -3846,7 +3920,7 @@ if st.session_state.page == "All Hands":
   <div class="card"><div class="card-label">Total Units</div><div class="card-val">{_tu:,}</div><div class="card-sub">{_ah_properties_sub}</div></div>
   <div class="card"><div class="card-label">Physical Occ</div><div class="card-val">{_phys_occ:.1f}%</div><div class="card-sub">Target {THR['physical_occ']}%</div></div>
   <div class="card"><div class="card-label">Economic Occ</div><div class="card-val">{_econ_occ:.1f}%</div><div class="card-sub">Target {THR['economic_occ']}%</div></div>
-  <div class="card"><div class="card-label">Collection Rate</div><div class="card-val">{_pct_coll:.1f}%</div><div class="card-sub">Target {THR['collection_rate']}%</div></div>
+  <div class="card"><div class="card-label">Collection Rate</div><div class="card-val">{_pct_txt}</div><div class="card-sub">Target {THR['collection_rate']}%</div></div>
 </div>
 
 <h2>Vacancy</h2>
@@ -3977,7 +4051,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
         f'<p style="color:#DBEAFE;font-size:11px;font-weight:700;letter-spacing:1.8px;margin:0 0 4px 0;">MONTHLY RENT ROLL</p>'
         f'<p style="color:#fff;font-size:30px;font-weight:800;margin:0;line-height:1.1;">${_sum_rent:,.0f}</p>'
         f'<p style="color:#93C5FD;font-size:13px;margin:5px 0 0 0;">'
-        f'Collection Rate: <strong style="color:#fff;">{_pct_coll:.1f}%</strong>'
+        f'Collection Rate: <strong style="color:#fff;">{_pct_txt}</strong>'
         f'</p></div>'
         '</div>',
         unsafe_allow_html=True,
@@ -4001,7 +4075,7 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
                                 status=_tl(_econ_occ, THR["economic_occ"]),
                                 sub=f"Target {THR['economic_occ']}%"),unsafe_allow_html=True)
 
-    with a3: st.markdown(kpi("Collection Rate",f"{_pct_coll:.1f}%",
+    with a3: st.markdown(kpi("Collection Rate",_pct_txt,
                                 status=_tl(_pct_coll, THR["collection_rate"]),
                                 sub=f"Target {THR['collection_rate']}%"),unsafe_allow_html=True)
 
@@ -4406,7 +4480,9 @@ Generated {_ah_date} · {COMPANY} Executive Dashboard
     else:
         _watch.append(f"Physical occupancy {_phys_occ:.1f}% below {THR['physical_occ']}% target")
 
-    if _pct_coll >= THR["collection_rate"]:
+    if pd.isna(_pct_coll):
+        _watch.append("Collection rate unavailable — receivables report not loaded")
+    elif _pct_coll >= THR["collection_rate"]:
         _wins.append(f"Collection rate {_pct_coll:.1f}% — on track")
     else:
         _watch.append(f"Collection rate {_pct_coll:.1f}% below {THR['collection_rate']}% target")
@@ -4736,9 +4812,9 @@ if st.session_state.page == "Overview":
     revenue_gap    = float(df_metrics_f["Revenue Gap ($)"].sum()) if "Revenue Gap ($)" in df_metrics_f.columns else 0
 
     sum_rent, pd_sum, _overview_collected, pct_collected, _overview_props = monthly_rent_collection(
-        df_rr_f, _f(df_aged_all), pd.Timestamp(now().date()).to_period("M"))
+        df_rr_f, df_aged_all, pd.Timestamp(now().date()).to_period("M"))
 
-    st.caption("Collection Rate: monthly rent less reporting-month Rental Income and Section 8 balances, for Current residents and selected properties. Balance-based calculation; not a cash-receipts report.")
+    st.caption("Collection Rate: monthly rent of Current and Notice residents less reporting-month Rental Income and Section 8 balances, for the selected properties. Properties with no open balances count as 100%. Balance-based calculation; not a cash-receipts report.")
 
     # Renewal rate
     renewal_rate = 0.0
@@ -4838,8 +4914,8 @@ if st.session_state.page == "Overview":
     _grp("Financials", "#059669")
     c4, c5, c6 = st.columns(3)
     with c4: st.markdown(kpi("Monthly Rent (Current)", f"${sum_rent:,.0f}",
-                              sub="Sum of rent — Current tenants only"), unsafe_allow_html=True)
-    with c5: st.markdown(kpi("% Collected", f"{pct_collected:.1f}%", delta_coll, "%",
+                              sub="Sum of rent — Current + Notice residents"), unsafe_allow_html=True)
+    with c5: st.markdown(kpi("% Collected", f"{pct_collected:.1f}%" if pd.notna(pct_collected) else "—", delta_coll if pd.notna(pct_collected) else None, "%",
                               status=_tl(pct_collected, THR["collection_rate"]),
                               sub=f"Target {THR['collection_rate']}% monthly rent collection",
                               delta_label=_prev_date_label), unsafe_allow_html=True)
@@ -6031,8 +6107,8 @@ elif st.session_state.page == "Collection":
     if "Past Due" in df_c.columns: df_c["Past Due"] = clean_money_column(df_c["Past Due"])
 
     billed, past_due, collected, pct_c, prop_c = monthly_rent_collection(
-        df_rr_f, _f(df_aged_all), pd.Timestamp(now().date()).to_period("M"))
-    st.caption("Calculated as monthly rent less outstanding Rental Income and Section 8 charges for the reporting month. Current residents only; the same property filters apply to both amounts. This balance calculation is not a cash-receipts report.")
+        df_rr_f, df_aged_all, pd.Timestamp(now().date()).to_period("M"))
+    st.caption("Calculated as monthly rent less outstanding Rental Income and Section 8 charges for the reporting month. Current and Notice residents; properties with no open balances count as 100%. This balance calculation is not a cash-receipts report.")
     if pd.isna(pct_c):
         st.warning("Collection rate unavailable: current-month charge detail or resident identifiers are missing.")
 
@@ -6102,12 +6178,12 @@ elif st.session_state.page == "Collection":
 
     c1,c2,c3 = st.columns(3)
     with c1: st.markdown(kpi("Total Billed", f"${billed:,.0f}",
-                              sub="Scheduled monthly rent · Current tenants"), unsafe_allow_html=True)
-    with c2: st.markdown(kpi("Amount Collected", f"${collected:,.0f}",
+                              sub="Scheduled monthly rent · Current + Notice"), unsafe_allow_html=True)
+    with c2: st.markdown(kpi("Amount Collected", f"${collected:,.0f}" if pd.notna(collected) else "—",
                               sub="Monthly rent less current-month rent balance"), unsafe_allow_html=True)
-    with c3: st.markdown(kpi("Outstanding Balance", f"${past_due:,.0f}",
+    with c3: st.markdown(kpi("Outstanding Balance", f"${past_due:,.0f}" if pd.notna(past_due) else "—",
                               status=_tl(pct_c, THR["collection_rate"]),
-                              sub="Current-month rent + Section 8 · Current tenants"),
+                              sub="Current-month rent + Section 8 · Current + Notice"),
                          unsafe_allow_html=True)
 
     
@@ -6241,7 +6317,7 @@ elif st.session_state.page == "Collection":
     section("Collection Detail by Property")
     prop_c_disp = prop_c_view.sort_values("pct", ascending=True).copy()  # worst first in table
     prop_c_disp["#"]            = range(1, len(prop_c_disp) + 1)
-    prop_c_disp["% Collected"]  = prop_c_disp["pct"].map(lambda x: f"{x:.1f}%")
+    prop_c_disp["% Collected"]  = prop_c_disp["pct"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "— (rent $0)")
     prop_c_disp["Billed"]       = prop_c_disp["billed"].map(lambda x: f"${x:,.0f}")
     prop_c_disp["Collected"]    = prop_c_disp["collected"].map(lambda x: f"${x:,.0f}")
     prop_c_disp["Outstanding"]  = prop_c_disp["past_due"].map(lambda x: f"${x:,.0f}")

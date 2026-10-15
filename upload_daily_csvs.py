@@ -35,6 +35,7 @@ def fetch_all_supabase(table, snapshot_date, page_size=1000):
             supabase.table(table)
             .select("*")
             .eq("snapshot_date", snapshot_date)
+            .order("id")   # fixed order so pages don't skip/duplicate rows
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -403,8 +404,10 @@ def upload_calls():
     period_start = pd.to_datetime(raw.iat[3, 1], errors="coerce")
     period_end = pd.to_datetime(raw.iat[3, 2], errors="coerce")
 
-    df = raw.iloc[11:].reset_index(drop=True)
-
+    # The first 7 columns always keep the same order. RingCentral may add
+    # columns at the end (e.g. "Call Response- Answered/Connected"), so take
+    # them by position instead of requiring a fixed column count.
+    df = raw.iloc[11:, :7].reset_index(drop=True)
     df.columns = [
         "Name",
         "Ext",
@@ -413,11 +416,6 @@ def upload_calls():
         "Inbound",
         "Outbound",
         "Missed with VM",
-        "_extra",
-    ]
-
-    df = df[
-        ["Name", "Ext", "Total Calls", "Avg Daily", "Inbound", "Outbound", "Missed with VM"]
     ]
 
     df = df[df["Name"].notna() & (df["Name"].astype(str).str.strip() != "")]

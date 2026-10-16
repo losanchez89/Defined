@@ -153,6 +153,47 @@ def clean_property_name(name):
 COLLECTION_STATUSES = {"Current", "Notice-Unrented", "Notice-Rented"}
 
 
+_ADDRESS_TAIL_RE = re.compile(r",\s*[A-Z]{2}\s+\d{5}\s*$")
+_PROP_KEY_CACHE: dict = {}
+
+
+def prop_match_key(name) -> str:
+    """Key to match the same property across AppFolio reports.
+
+    Rent Roll:      '10020 Zelzah Avenue - 10020 Zelzah Avenue Northridge, CA 91325'
+    Leasing Funnel: '10020 Zelzah Avenue'
+    Rent Roll:      'CAN - Canterbury Apartments - 6125 Canterbury Dr. Culver City, CA 90230'
+    Leasing Funnel: 'Canterbury Apartments'
+    All of them map to the same key (no address, no leading code, lower-case).
+    """
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    raw = str(name)
+    hit = _PROP_KEY_CACHE.get(raw)
+    if hit is not None:
+        return hit
+    parts = [x.strip() for x in raw.split(" - ") if x.strip()]
+    if len(parts) > 1 and _ADDRESS_TAIL_RE.search(parts[-1]):
+        parts = parts[:-1]                       # drop trailing full address
+    seen, out = set(), []
+    for x in parts:                              # drop repeated pieces
+        k = x.casefold()
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    if len(out) > 1 and re.fullmatch(r"[A-Z]{2,4}", out[0]):
+        out = out[1:]                            # drop leading code (CAN, PRE, WIN...)
+    key = " ".join(" - ".join(out).split()).casefold()
+    _PROP_KEY_CACHE[raw] = key
+    return key
+
+
+def prop_isin(series, properties) -> "pd.Series":
+    """Boolean mask: rows whose property matches any of `properties` (by match key)."""
+    keys = {prop_match_key(p) for p in properties}
+    return series.map(prop_match_key).isin(keys)
+
+
 def monthly_rent_collection(rr, aged, period):
     """Monthly collection rate = (rent billed - this month's open rent balances) / rent billed.
 
@@ -590,7 +631,12 @@ def calculate_metrics(df_rent_roll, df_funnel=None):
         })
         if "Property" in df_funnel.columns:
             print("   Integrando datos del Funnel...")
-            df_metrics = df_metrics.merge(df_funnel, on="Property", how="left")
+            # Funnel uses short names; join on the property match key.
+            df_funnel["_pkey"] = df_funnel["Property"].map(prop_match_key)
+            _fcols = [c for c in df_funnel.columns if c not in ("Property", "_pkey")]
+            df_funnel = df_funnel.groupby("_pkey", as_index=False)[_fcols].sum(numeric_only=True)
+            df_metrics["_pkey"] = df_metrics["Property"].map(prop_match_key)
+            df_metrics = df_metrics.merge(df_funnel, on="_pkey", how="left").drop(columns="_pkey")
         else:
             print("   ⚠️ Funnel skipped: missing Property column")
     else:
@@ -2104,7 +2150,7 @@ def _completed_showings_weekly_from_funnel(properties: tuple[str, ...] = (), wee
         d = d.dropna(subset=["snapshot_date"])
 
         if properties:
-            d = d[d["property"].isin(list(properties))].copy()
+            d = d[prop_isin(d["property"], properties)].copy()
 
         if d.empty:
             return pd.DataFrame({"Week": _week_index, "Count": [0] * len(_week_index)}), 0
@@ -2205,7 +2251,7 @@ def _leasing_funnel_activity_range(start_date, end_date, properties: tuple[str, 
         d["snapshot_date"] = pd.to_datetime(d["snapshot_date"], errors="coerce").dt.normalize()
         d = d.dropna(subset=["snapshot_date"])
         if properties:
-            d = d[d["property"].isin(list(properties))].copy()
+            d = d[prop_isin(d["property"], properties)].copy()
         if d.empty:
             return empty_totals, empty_weekly
 
@@ -3226,9 +3272,11 @@ def _f(df, col="Property"):
     if not SEL:
         # Whole portfolio: drop properties excluded in Portfolio.xlsx (e.g. JTM Land)
         if _excluded_props and col in df.columns:
-            return df[~df[col].isin(_excluded_props)].copy()
+            return df[~prop_isin(df[col], _excluded_props)].copy()
         return df
-    return df[df[col].isin(SEL)].copy() if col in df.columns else df
+    # Match by property key: some reports (Leasing Funnel, Rental Applications,
+    # Tenant Tickler) use short names instead of the Rent Roll's full name.
+    return df[prop_isin(df[col], SEL)].copy() if col in df.columns else df
 
 df_rr_f      = _f(df_rr)
 df_metrics_f = _f(df_metrics)

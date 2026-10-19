@@ -2612,6 +2612,13 @@ def _portfolio_of(prop, mapping):
     for k, v in mapping.items():
         if norm(k) == target:
             return v
+    # AppFolio sometimes renames properties (drops the 'CAN - ' code, changes
+    # address capitalization). Fall back to the property match key.
+    target_key = prop_match_key(prop)
+    if target_key:
+        for k, v in mapping.items():
+            if prop_match_key(k) == target_key:
+                return v
     return UNASSIGNED_PORTFOLIO
 
 

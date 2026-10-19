@@ -1010,6 +1010,14 @@ def upload_historical_metrics():
         fetch_all_supabase("rent_roll", snapshot_date)
     )
 
+    if df_rr.empty or "status" not in df_rr.columns:
+        # e.g. only the RingCentral emails arrived today (AppFolio reports not yet)
+        print(
+            f"No rent_roll snapshot for {snapshot_date}; "
+            "skipping historical_metrics."
+        )
+        return
+
     total_units = len(df_rr)
 
     occupied_statuses = [

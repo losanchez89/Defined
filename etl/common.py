@@ -3,7 +3,8 @@ import glob
 import os
 import pandas as pd
 
-SNAPSHOT_DATE = date.today().isoformat()
+# Optional override to load a past day, e.g. SNAPSHOT_DATE=2026-10-31
+SNAPSHOT_DATE = os.getenv("SNAPSHOT_DATE") or date.today().isoformat()
 
 
 def find_latest(prefix):

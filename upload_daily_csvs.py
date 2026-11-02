@@ -15,7 +15,8 @@ from etl.upload_lease_history_non_revenue import upload_lease_history_non_revenu
 
 
 DATA_DIR = Path("data/raw")
-SNAPSHOT_DATE = date.today().isoformat()
+# Optional override to load a past day, e.g. SNAPSHOT_DATE=2026-10-31
+SNAPSHOT_DATE = os.getenv("SNAPSHOT_DATE") or date.today().isoformat()
 
 
 def find_latest(prefix):
@@ -260,6 +261,15 @@ def upload_work_orders():
         "Work Order Issue": "work_order_issue",
         "Vendor": "vendor",
         "Work Order Type": "work_order_type",
+        # Unit Turn KPI Board
+        "Unit Turn ID": "unit_turn_id",
+        "Estimate Req On": "estimate_req_on",
+        "Estimated On": "estimated_on",
+        "Estimate Amount": "estimate_amount",
+        "Estimate Approval Status": "estimate_approval_status",
+        "Estimate Approved On": "estimate_approved_on",
+        "Estimate Approval Last Requested On": "estimate_approval_last_requested_on",
+        "Work Done On": "work_done_on",
     }
 
     df = df.rename(columns=rename)
@@ -276,6 +286,14 @@ def upload_work_orders():
         "work_order_issue",
         "vendor",
         "work_order_type",
+        "unit_turn_id",
+        "estimate_req_on",
+        "estimated_on",
+        "estimate_amount",
+        "estimate_approval_status",
+        "estimate_approved_on",
+        "estimate_approval_last_requested_on",
+        "work_done_on",
     ]
 
     df = df[[c for c in keep_cols if c in df.columns]]
@@ -288,6 +306,13 @@ def upload_work_orders():
     df["days_to_resolve"] = (completed - created).dt.days
 
     df["completed_on"] = completed.dt.strftime("%Y-%m-%d")
+
+    if "estimate_amount" in df.columns:
+        df["estimate_amount"] = df["estimate_amount"].apply(clean_money)
+    for col in ["estimate_req_on", "estimated_on", "estimate_approved_on",
+                "estimate_approval_last_requested_on", "work_done_on"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
 
     records = clean_for_json(df)
 
@@ -391,7 +416,7 @@ def upload_aged_receivable():
 
 def upload_calls():
     xlsx_file = r"data/raw/Users_Dashboard.xlsx"
-    snapshot_date = date.today().strftime("%Y-%m-%d")
+    snapshot_date = SNAPSHOT_DATE
 
     if not os.path.exists(xlsx_file):
         print("No calls file found")
@@ -467,7 +492,7 @@ def upload_leads():
 
     print(f"Found leads file: {fp}")
     df = pd.read_csv(fp)
-    snapshot_date = date.today().strftime("%Y-%m-%d")
+    snapshot_date = SNAPSHOT_DATE
 
     df = df.rename(columns={
         "Property": "property",
@@ -524,7 +549,7 @@ def upload_leasing_funnel():
 
     print(f"Found leasing_funnel file: {fp}")
     df = pd.read_csv(fp)
-    snapshot_date = date.today().strftime("%Y-%m-%d")
+    snapshot_date = SNAPSHOT_DATE
 
     df.columns = [c.strip() for c in df.columns]
 
@@ -640,7 +665,7 @@ def upload_vacancy_detail():
 
     print(f"Found vacancy_detail file: {fp}")
     df = pd.read_csv(fp)
-    snapshot_date = date.today().strftime("%Y-%m-%d")
+    snapshot_date = SNAPSHOT_DATE
 
     df = df.rename(columns={
         "Property": "property",
